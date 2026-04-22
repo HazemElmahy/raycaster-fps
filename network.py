@@ -13,9 +13,24 @@ import threading
 import time
 import math
 
+from enemy_ai import ServerEnemyAI
+
 BROADCAST_PORT = 5555
 BUFFER_SIZE = 8192
 SERVER_TICK_RATE = 30  # broadcasts per second
+
+MAX_DEPTH = 50
+
+# Weapon definitions (mirrored from main.py for server-side hit processing)
+WPN_RIFLE = 0
+WPN_PISTOL = 1
+WPN_KNIFE = 2
+
+SERVER_WEAPONS = {
+    WPN_RIFLE:  {"damage": 2, "ammo_cost": 1, "range": MAX_DEPTH, "spread": 0.03},
+    WPN_PISTOL: {"damage": 1, "ammo_cost": 1, "range": MAX_DEPTH, "spread": 0.06},
+    WPN_KNIFE:  {"damage": 3, "ammo_cost": 0, "range": 1.5,       "spread": 0.2},
+}
 
 SPAWN_POSITIONS = [
     (2.0, 2.0),
@@ -54,7 +69,7 @@ def _recv(sock):
 # Server (runs on the host's machine alongside their game client)
 # ---------------------------------------------------------------------------
 class GameServer:
-    def __init__(self, world_map, spawn_enemies_fn):
+    def __init__(self, world_map, spawn_enemies_fn, player_spawn=None):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", BROADCAST_PORT))
@@ -64,6 +79,8 @@ class GameServer:
         self.map_rows = len(world_map)
         self.map_cols = len(world_map[0])
         self.spawn_enemies_fn = spawn_enemies_fn
+        # Use provided spawn or fall back to SPAWN_POSITIONS
+        self.player_spawn = player_spawn or SPAWN_POSITIONS[0]
 
         self.players = {}       # id -> {x, y, angle, health, ammo, score, alive, addr, name, last_seen}
         self.next_id = 0
@@ -80,6 +97,9 @@ class GameServer:
         self.enemies = [
             {"x": e.x, "y": e.y, "hp": e.health, "alive": True, "dmg_timer": 0.0}
             for e in raw
+        ]
+        self.enemy_ais = [
+            ServerEnemyAI(e.x, e.y) for e in raw
         ]
 
     def _is_wall(self, x, y):
@@ -107,25 +127,27 @@ class GameServer:
     def _add_player(self, addr, name):
         pid = self.next_id
         self.next_id += 1
-        sx, sy = SPAWN_POSITIONS[pid % len(SPAWN_POSITIONS)]
+        sx, sy = self.player_spawn
         self.players[pid] = {
             "x": sx, "y": sy, "angle": 0.0,
             "health": 100, "ammo": 50, "score": 0, "alive": True,
             "addr": addr, "name": name,
             "shoot": False, "shoot_processed": True,
+            "weapon": WPN_PISTOL,
             "damage_cooldown": 0.0,
             "last_seen": time.time(),
         }
         self.addr_to_id[addr] = pid
         return pid
 
-    def update_host_state(self, x, y, angle, shoot):
+    def update_host_state(self, x, y, angle, shoot, weapon=WPN_PISTOL):
         """Called by the host's game loop to push its own state."""
         if 0 in self.players:
             p = self.players[0]
             p["x"] = x
             p["y"] = y
             p["angle"] = angle
+            p["weapon"] = weapon
             if shoot and p["shoot_processed"]:
                 p["shoot"] = True
                 p["shoot_processed"] = False
@@ -166,7 +188,7 @@ class GameServer:
                     pid = self._add_player(addr, data.get("name", "Player"))
                 else:
                     pid = self.addr_to_id[addr]
-                sx, sy = SPAWN_POSITIONS[pid % len(SPAWN_POSITIONS)]
+                sx, sy = self.player_spawn
                 _send(self.sock, {"t": "welcome", "id": pid, "x": sx, "y": sy}, addr)
 
             elif msg_type == "state":
@@ -176,6 +198,7 @@ class GameServer:
                     p["x"] = data.get("x", p["x"])
                     p["y"] = data.get("y", p["y"])
                     p["angle"] = data.get("a", p["angle"])
+                    p["weapon"] = data.get("w", p["weapon"])
                     if data.get("shoot") and p["shoot_processed"]:
                         p["shoot"] = True
                         p["shoot_processed"] = False
@@ -190,7 +213,7 @@ class GameServer:
         # Find nearest alive player for each enemy
         alive_players = [(pid, p) for pid, p in self.players.items() if p["alive"]]
 
-        for e in self.enemies:
+        for i, e in enumerate(self.enemies):
             if not e["alive"]:
                 continue
             e["dmg_timer"] = max(0, e["dmg_timer"] - dt)
@@ -198,7 +221,7 @@ class GameServer:
             if not alive_players:
                 continue
 
-            # Chase nearest player
+            # Find nearest player
             best_dist = float("inf")
             best_px, best_py = e["x"], e["y"]
             for pid, p in alive_players:
@@ -207,18 +230,11 @@ class GameServer:
                     best_dist = d
                     best_px, best_py = p["x"], p["y"]
 
-            if best_dist > 0.8:
-                dx = best_px - e["x"]
-                dy = best_py - e["y"]
-                dist = math.hypot(dx, dy)
-                speed = 1.0
-                mx = (dx / dist) * speed * dt
-                my = (dy / dist) * speed * dt
-                nx, ny = e["x"] + mx, e["y"] + my
-                if not self._is_wall(nx, e["y"]):
-                    e["x"] = nx
-                if not self._is_wall(e["x"], ny):
-                    e["y"] = ny
+            # Use AI for movement
+            if i < len(self.enemy_ais):
+                ai = self.enemy_ais[i]
+                ai.update(e, best_px, best_py, dt, self.world_map,
+                          self._is_wall, best_dist)
 
         # Enemy contact damage to players
         for pid, p in alive_players:
@@ -241,9 +257,11 @@ class GameServer:
             p["shoot"] = False
             p["shoot_processed"] = True
 
-            if p["ammo"] <= 0:
+            wpn = SERVER_WEAPONS.get(p["weapon"], SERVER_WEAPONS[WPN_PISTOL])
+
+            if wpn["ammo_cost"] > 0 and p["ammo"] < wpn["ammo_cost"]:
                 continue
-            p["ammo"] -= 1
+            p["ammo"] -= wpn["ammo_cost"]
 
             # Find enemy in crosshair
             best_enemy = None
@@ -254,19 +272,21 @@ class GameServer:
                 dx = e["x"] - p["x"]
                 dy = e["y"] - p["y"]
                 dist = math.hypot(dx, dy)
+                if dist > wpn["range"]:
+                    continue
                 angle = math.atan2(dy, dx)
                 diff = angle - p["angle"]
                 while diff > math.pi:
                     diff -= 2 * math.pi
                 while diff < -math.pi:
                     diff += 2 * math.pi
-                hit_threshold = max(0.05, 0.3 / max(dist, 0.1))
+                hit_threshold = max(wpn["spread"], 0.3 / max(dist, 0.1))
                 if abs(diff) < hit_threshold and dist < best_dist:
                     best_dist = dist
                     best_enemy = e
 
             if best_enemy:
-                best_enemy["hp"] -= 1
+                best_enemy["hp"] -= wpn["damage"]
                 best_enemy["dmg_timer"] = 0.15
                 if best_enemy["hp"] <= 0:
                     best_enemy["alive"] = False
@@ -336,12 +356,13 @@ class GameClient:
         self.server_addr = (host_ip, BROADCAST_PORT)
         _send(self.sock, {"t": "join", "name": name}, self.server_addr)
 
-    def send_state(self, x, y, angle, shoot):
+    def send_state(self, x, y, angle, shoot, weapon=WPN_PISTOL):
         if self.server_addr:
             _send(self.sock, {
                 "t": "state",
                 "x": round(x, 3), "y": round(y, 3),
                 "a": round(angle, 3), "shoot": shoot,
+                "w": weapon,
             }, self.server_addr)
 
     def poll(self):

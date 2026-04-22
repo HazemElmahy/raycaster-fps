@@ -4,13 +4,18 @@ Raycasting FPS Game with LAN Multiplayer
 Controls:
   WASD          - Move
   Mouse         - Look around
-  Left Click    - Shoot
-  Space         - Shoot
+  Left Click    - Shoot / Attack
+  Space         - Shoot / Attack
+  1             - Rifle
+  2             - Pistol
+  3             - Knife
+  Mouse Wheel   - Cycle weapons
   R             - Restart (when dead)
   ESC           - Quit / Back to menu
   TAB           - Scoreboard (multiplayer)
 """
 
+import os
 import pygame
 import math
 import sys
@@ -20,6 +25,9 @@ from network import (
     GameServer, GameClient, get_local_ip,
     PLAYER_COLORS, SPAWN_POSITIONS,
 )
+from generate_sprites import generate_all_sprites, sprites_exist
+from generate_enemy_sprites import generate_all_enemy_sprites, enemy_sprites_exist
+from enemy_ai import EnemyAI, STATE_PATROL, STATE_CHASE, STATE_ATTACK, STATE_RETREAT
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -32,15 +40,26 @@ FOV = math.pi / 3
 HALF_FOV = FOV / 2
 NUM_RAYS = SCREEN_WIDTH // 2
 DELTA_ANGLE = FOV / NUM_RAYS
-MAX_DEPTH = 20
+MAX_DEPTH = 50
 SCALE = SCREEN_WIDTH // NUM_RAYS
 
 PLAYER_SPEED = 3.0
-PLAYER_ROT_SPEED = 0.003
+PLAYER_ROT_SPEED = 0.003  # default, overridden by game_settings["mouse_sensitivity"]
 PLAYER_SIZE_SCALE = 0.3
+MAX_PITCH = 300  # max vertical look offset in pixels
+ADS_FOV_MULT = 0.65       # FOV multiplier when aiming
+ADS_SENS_MULT = 0.5       # sensitivity multiplier when aiming
+ADS_LERP_SPEED = 10.0     # how fast ADS transitions (per second)
 
 MINIMAP_SCALE = 5
 MINIMAP_OFFSET = 10
+
+# Game settings (mutable, shared across menus and game loops)
+game_settings = {
+    "fullscreen": False,
+    "mouse_sensitivity": 0.003,
+    "volume": 0.7,
+}
 
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
@@ -60,28 +79,65 @@ WALL_COLORS = {
 }
 
 # ---------------------------------------------------------------------------
-# Map
+# Weapons:  1 = Rifle, 2 = Pistol, 3 = Knife
 # ---------------------------------------------------------------------------
-WORLD_MAP = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 2, 2, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 1],
-    [1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1],
-    [1, 0, 0, 3, 3, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
-MAP_ROWS = len(WORLD_MAP)
-MAP_COLS = len(WORLD_MAP[0])
+WPN_RIFLE = 0
+WPN_PISTOL = 1
+WPN_KNIFE = 2
+NUM_WEAPONS = 3
+
+WEAPONS = {
+    WPN_RIFLE: {
+        "name": "Rifle",
+        "damage": 2,        # hits to remove from enemy hp
+        "fire_rate": 0.45,  # seconds between shots
+        "ammo_cost": 1,     # ammo consumed per shot
+        "range": MAX_DEPTH,
+        "spread": 0.03,     # hit-angle tolerance (tighter = more precise)
+    },
+    WPN_PISTOL: {
+        "name": "Pistol",
+        "damage": 1,
+        "fire_rate": 0.2,
+        "ammo_cost": 1,
+        "range": MAX_DEPTH,
+        "spread": 0.06,
+    },
+    WPN_KNIFE: {
+        "name": "Knife",
+        "damage": 3,
+        "fire_rate": 0.35,
+        "ammo_cost": 0,     # no ammo needed
+        "range": 1.5,       # melee range
+        "spread": 0.2,      # wide swing
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Map — dynamically generated, these are the current active map globals
+# ---------------------------------------------------------------------------
+DUNGEON_WIDTH = 48
+DUNGEON_HEIGHT = 48
+
+WORLD_MAP = [[1] * 16 for _ in range(16)]  # placeholder, replaced by new_dungeon()
+MAP_ROWS = 16
+MAP_COLS = 16
+CURRENT_ENEMY_SPAWNS = []   # set by new_dungeon()
+CURRENT_PLAYER_SPAWN = (2.0, 2.0)
+
+
+def new_dungeon(width=DUNGEON_WIDTH, height=DUNGEON_HEIGHT, seed=None):
+    """Generate a fresh dungeon and update the global map state."""
+    global WORLD_MAP, MAP_ROWS, MAP_COLS, CURRENT_ENEMY_SPAWNS, CURRENT_PLAYER_SPAWN
+    from worldgen import generate_dungeon
+
+    grid, player_spawn, enemy_spawns, rooms = generate_dungeon(width, height, seed)
+    WORLD_MAP = grid
+    MAP_ROWS = len(grid)
+    MAP_COLS = len(grid[0])
+    CURRENT_PLAYER_SPAWN = player_spawn
+    CURRENT_ENEMY_SPAWNS = enemy_spawns
+    return player_spawn, enemy_spawns
 
 
 def is_wall(x, y):
@@ -100,22 +156,15 @@ class Enemy:
         self.y = y
         self.alive = True
         self.health = 3
-        self.speed = 1.0
+        self.speed = 1.5
         self.damage_timer = 0.0
+        self.ai = EnemyAI(x, y)
 
-    def update(self, px, py, dt):
+    def update(self, px, py, dt, all_enemies=None, gunfire=False):
         if not self.alive:
             return
         self.damage_timer = max(0, self.damage_timer - dt)
-        dx, dy = px - self.x, py - self.y
-        dist = math.hypot(dx, dy)
-        if dist > 0.8:
-            mx = (dx / dist) * self.speed * dt
-            my = (dy / dist) * self.speed * dt
-            if not is_wall(self.x + mx, self.y):
-                self.x += mx
-            if not is_wall(self.x, self.y + my):
-                self.y += my
+        self.ai.update(self, px, py, dt, WORLD_MAP, all_enemies, gunfire)
 
     def take_damage(self):
         self.health -= 1
@@ -124,14 +173,9 @@ class Enemy:
             self.alive = False
 
 
-ENEMY_SPAWNS = [
-    (4.5, 4.5), (12.5, 3.5), (7.5, 12.5), (13.5, 10.5),
-    (3.5, 12.5), (10.5, 7.5), (5.5, 9.5), (13.5, 13.5),
-]
-
-
 def spawn_enemies():
-    return [Enemy(x, y) for x, y in ENEMY_SPAWNS]
+    """Spawn enemies at the current dungeon's positions."""
+    return [Enemy(x, y) for x, y in CURRENT_ENEMY_SPAWNS]
 
 
 # ---------------------------------------------------------------------------
@@ -196,53 +240,67 @@ def draw_sky_and_floor(surface):
         pygame.draw.line(surface, color, (0, y), (SCREEN_WIDTH, y))
 
 
-def draw_walls(surface, walls):
+def draw_walls(surface, walls, pitch_offset=0):
     for ray, depth, wh, wt, hs in walls:
         base = WALL_COLORS.get(wt, (160, 160, 170))
         shade = max(0.15, 1.0 - depth / MAX_DEPTH)
         sm = 0.7 if hs == 1 else 1.0
         color = tuple(max(0, min(255, int(c * shade * sm))) for c in base)
         x = ray * SCALE
-        y = (SCREEN_HEIGHT - wh) / 2
+        y = (SCREEN_HEIGHT - wh) / 2 + pitch_offset
         pygame.draw.rect(surface, color, (x, y, SCALE, wh))
 
 
-def _draw_sprite(surface, screen_x, dist, body_color, head_color, wall_depths):
-    sprite_height = min(SCREEN_HEIGHT, int(SCREEN_HEIGHT * 0.6 / max(dist, 0.1)))
-    sprite_width = sprite_height // 2
+def _draw_enemy_sprite(surface, screen_x, dist, wall_depths, ai_state, dmg_timer, game_time, pitch_offset=0):
+    """Draw an enemy drone sprite at screen_x based on distance and AI state."""
+    if not ENEMY_SPRITES:
+        return
+
+    # Depth check — don't draw if behind a wall
     ray_idx = int(screen_x / SCREEN_WIDTH * NUM_RAYS)
     if 0 <= ray_idx < NUM_RAYS and dist > wall_depths[ray_idx]:
         return
-    shade = max(0.2, 1.0 - dist / MAX_DEPTH)
-    bc = tuple(max(0, min(255, int(c * shade))) for c in body_color)
-    hc = tuple(max(0, min(255, int(c * shade))) for c in head_color)
-    top = SCREEN_HEIGHT // 2 - sprite_height // 2
-    # Body
-    pygame.draw.rect(surface, bc, (
-        screen_x - sprite_width // 2,
-        top + sprite_height // 4,
-        sprite_width,
-        sprite_height * 3 // 4,
-    ))
-    # Head
-    hr = max(2, sprite_width // 3)
-    hy = top + sprite_height // 6
-    pygame.draw.circle(surface, hc, (screen_x, hy), hr)
-    if hr > 4:
-        eo = hr // 3
-        er = max(1, hr // 5)
-        pygame.draw.circle(surface, BLACK, (screen_x - eo, hy - er), er)
-        pygame.draw.circle(surface, BLACK, (screen_x + eo, hy - er), er)
+
+    # Pick sprite based on state / damage
+    if dmg_timer > 0:
+        sprite = ENEMY_SPRITES["hit"]
+    else:
+        sprite = ENEMY_SPRITES.get(ai_state, ENEMY_SPRITES[STATE_CHASE])
+
+    # Scale based on distance
+    scale_factor = max(0.05, SCREEN_HEIGHT * 0.5 / max(dist, 0.3))
+    sw = int(sprite.get_width() * scale_factor / SCREEN_HEIGHT * 2.5)
+    sh = int(sprite.get_height() * scale_factor / SCREEN_HEIGHT * 2.5)
+    sw = max(4, min(SCREEN_WIDTH, sw))
+    sh = max(4, min(SCREEN_HEIGHT, sh))
+
+    scaled = pygame.transform.smoothscale(sprite, (sw, sh))
+
+    # Distance shading
+    shade = max(0.25, 1.0 - dist / MAX_DEPTH)
+    if shade < 0.95:
+        dark = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        dark.fill((0, 0, 0, int((1.0 - shade) * 200)))
+        scaled.blit(dark, (0, 0))
+
+    # Vertical position — centered on screen horizon with slight bob
+    bob = int(math.sin(game_time * 6) * 2 * (scale_factor / 100)) if dmg_timer <= 0 else 0
+    x = screen_x - sw // 2
+    y = SCREEN_HEIGHT // 2 - sh // 2 + bob + pitch_offset
+
+    surface.blit(scaled, (x, y))
 
 
-def draw_enemies_from_list(surface, enemy_list, px, py, pangle, wall_depths):
-    """Draw enemies from a list of dicts (multiplayer) or Enemy objects (singleplayer)."""
+def draw_enemies_from_list(surface, enemy_list, px, py, pangle, wall_depths, game_time=0.0, pitch_offset=0):
+    """Draw enemies as drone sprites."""
     render = []
     for e in enemy_list:
         if isinstance(e, dict):
             ex, ey, alive, dmg = e["x"], e["y"], e["alive"], e.get("dt", 0)
+            ai_state = STATE_CHASE  # multiplayer enemies default to chase look
         else:
             ex, ey, alive, dmg = e.x, e.y, e.alive, e.damage_timer
+            ai_state = e.ai.state if hasattr(e, "ai") else STATE_CHASE
         if not alive:
             continue
         dx, dy = ex - px, ey - py
@@ -254,19 +312,39 @@ def draw_enemies_from_list(surface, enemy_list, px, py, pangle, wall_depths):
         while ad < -math.pi: ad += 2 * math.pi
         if abs(ad) > HALF_FOV + 0.1:
             continue
-        render.append((dist, ex, ey, ad, dmg))
+        render.append((dist, ad, ai_state, dmg))
 
     render.sort(key=lambda r: -r[0])
-    for dist, ex, ey, ad, dmg in render:
+    for dist, ad, ai_state, dmg in render:
         sx = int((ad / FOV + 0.5) * SCREEN_WIDTH)
-        if dmg > 0:
-            bc, hc = (255, 255, 255), (255, 255, 255)
-        else:
-            bc, hc = (200, 50, 50), (220, 180, 150)
-        _draw_sprite(surface, sx, dist, bc, hc, wall_depths)
+        _draw_enemy_sprite(surface, sx, dist, wall_depths, ai_state, dmg, game_time, pitch_offset)
 
 
-def draw_other_players(surface, players, my_id, px, py, pangle, wall_depths):
+def _draw_player_sprite(surface, screen_x, dist, body_color, wall_depths, pitch_offset=0):
+    """Draw a player as a simple colored humanoid."""
+    sprite_height = min(SCREEN_HEIGHT, int(SCREEN_HEIGHT * 0.6 / max(dist, 0.1)))
+    sprite_width = sprite_height // 2
+    ray_idx = int(screen_x / SCREEN_WIDTH * NUM_RAYS)
+    if 0 <= ray_idx < NUM_RAYS and dist > wall_depths[ray_idx]:
+        return
+    shade = max(0.2, 1.0 - dist / MAX_DEPTH)
+    bc = tuple(max(0, min(255, int(c * shade))) for c in body_color)
+    hc = tuple(max(0, min(255, int(c * shade))) for c in (220, 180, 150))
+    top = SCREEN_HEIGHT // 2 - sprite_height // 2 + pitch_offset
+    pygame.draw.rect(surface, bc, (
+        screen_x - sprite_width // 2, top + sprite_height // 4,
+        sprite_width, sprite_height * 3 // 4))
+    hr = max(2, sprite_width // 3)
+    hy = top + sprite_height // 6
+    pygame.draw.circle(surface, hc, (screen_x, hy), hr)
+    if hr > 4:
+        eo = hr // 3
+        er = max(1, hr // 5)
+        pygame.draw.circle(surface, BLACK, (screen_x - eo, hy - er), er)
+        pygame.draw.circle(surface, BLACK, (screen_x + eo, hy - er), er)
+
+
+def draw_other_players(surface, players, my_id, px, py, pangle, wall_depths, pitch_offset=0):
     """Draw other players as colored humanoid sprites."""
     render = []
     for pid_str, p in players.items():
@@ -288,31 +366,131 @@ def draw_other_players(surface, players, my_id, px, py, pangle, wall_depths):
     for dist, pid, ad in render:
         sx = int((ad / FOV + 0.5) * SCREEN_WIDTH)
         pc = PLAYER_COLORS[pid % len(PLAYER_COLORS)]
-        _draw_sprite(surface, sx, dist, pc, (220, 180, 150), wall_depths)
+        _draw_player_sprite(surface, sx, dist, pc, wall_depths, pitch_offset)
 
 
-def draw_weapon(surface, shooting_timer):
-    cx, by = SCREEN_WIDTH // 2, SCREEN_HEIGHT
-    oy = int(20 * shooting_timer / 0.15) if shooting_timer > 0 else 0
-    pygame.draw.rect(surface, (60, 60, 65), (cx - 20, by - 120 + oy, 40, 100))
-    pygame.draw.rect(surface, (80, 80, 85), (cx - 6, by - 160 + oy, 12, 50))
-    pygame.draw.rect(surface, (50, 50, 55), (cx - 8, by - 165 + oy, 16, 8))
-    if shooting_timer > 0.1:
-        pygame.draw.circle(surface, YELLOW, (cx, by - 170 + oy), 25)
-        pygame.draw.circle(surface, WHITE, (cx, by - 170 + oy), 12)
+# ---------------------------------------------------------------------------
+# Weapon sprite loading
+# ---------------------------------------------------------------------------
+WEAPON_SPRITES = {}  # populated by load_weapon_sprites()
+ENEMY_SPRITES = {}   # populated by load_enemy_sprites()
+
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "weapons")
+ENEMY_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "enemies")
 
 
-def draw_crosshair(surface):
+def load_weapon_sprites():
+    """Load weapon PNGs from assets/weapons/, generating them if needed."""
+    global WEAPON_SPRITES
+
+    if not sprites_exist(ASSETS_DIR):
+        generate_all_sprites(ASSETS_DIR)
+
+    WEAPON_SPRITES[WPN_PISTOL] = {
+        "idle": pygame.image.load(os.path.join(ASSETS_DIR, "pistol_idle.png")).convert_alpha(),
+        "fire": pygame.image.load(os.path.join(ASSETS_DIR, "pistol_fire.png")).convert_alpha(),
+    }
+    WEAPON_SPRITES[WPN_RIFLE] = {
+        "idle": pygame.image.load(os.path.join(ASSETS_DIR, "rifle_idle.png")).convert_alpha(),
+        "fire": pygame.image.load(os.path.join(ASSETS_DIR, "rifle_fire.png")).convert_alpha(),
+    }
+    WEAPON_SPRITES[WPN_KNIFE] = {
+        "idle": pygame.image.load(os.path.join(ASSETS_DIR, "knife_idle.png")).convert_alpha(),
+        "fire": pygame.image.load(os.path.join(ASSETS_DIR, "knife_swing.png")).convert_alpha(),
+    }
+
+    # Scale sprites to fit the screen nicely
+    target_h = int(SCREEN_HEIGHT * 0.45)
+    for wpn_id in WEAPON_SPRITES:
+        for key in WEAPON_SPRITES[wpn_id]:
+            sprite = WEAPON_SPRITES[wpn_id][key]
+            orig_w, orig_h = sprite.get_size()
+            scale = target_h / orig_h
+            new_w = int(orig_w * scale)
+            WEAPON_SPRITES[wpn_id][key] = pygame.transform.smoothscale(
+                sprite, (new_w, target_h)
+            )
+
+
+def load_enemy_sprites():
+    """Load drone enemy PNGs, generating if needed."""
+    global ENEMY_SPRITES
+
+    if not enemy_sprites_exist(ENEMY_ASSETS_DIR):
+        generate_all_enemy_sprites(ENEMY_ASSETS_DIR)
+
+    _load = lambda f: pygame.image.load(os.path.join(ENEMY_ASSETS_DIR, f)).convert_alpha()
+    ENEMY_SPRITES = {
+        STATE_PATROL:  _load("drone_patrol.png"),
+        STATE_CHASE:   _load("drone_chase.png"),
+        STATE_ATTACK:  _load("drone_attack.png"),
+        STATE_RETREAT: _load("drone_retreat.png"),
+        "hit":         _load("drone_hit.png"),
+        "wheel":       _load("drone_wheel.png"),
+    }
+
+
+def draw_weapon(surface, shooting_timer, weapon_id=WPN_PISTOL, ads_amount=0.0):
+    if weapon_id not in WEAPON_SPRITES:
+        return
+    fire_rate = WEAPONS[weapon_id]["fire_rate"]
+
+    # Pick idle or fire frame
+    if shooting_timer > fire_rate * 0.5:
+        frame = WEAPON_SPRITES[weapon_id]["fire"]
+    else:
+        frame = WEAPON_SPRITES[weapon_id]["idle"]
+
+    # Recoil bob
+    bob = int(25 * (shooting_timer / fire_rate)) if shooting_timer > 0 else 0
+
+    fw, fh = frame.get_size()
+
+    if ads_amount > 0.01 and weapon_id != WPN_KNIFE:
+        # ADS: scale up weapon and center it
+        zoom = 1.0 + ads_amount * 0.4
+        new_w = int(fw * zoom)
+        new_h = int(fh * zoom)
+        frame = pygame.transform.smoothscale(frame, (new_w, new_h))
+        x = (SCREEN_WIDTH - new_w) // 2
+        y = SCREEN_HEIGHT - new_h + int(20 * (1 - ads_amount)) + bob
+        # Raise weapon toward center when aiming
+        y -= int(ads_amount * fh * 0.15)
+    else:
+        x = (SCREEN_WIDTH - fw) // 2
+        y = SCREEN_HEIGHT - fh + 20 + bob
+
+    surface.blit(frame, (x, y))
+
+
+def draw_crosshair(surface, ads_amount=0.0):
     cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
-    c = (0, 255, 0)
-    pygame.draw.line(surface, c, (cx - 14, cy), (cx - 6, cy), 2)
-    pygame.draw.line(surface, c, (cx + 6, cy), (cx + 14, cy), 2)
-    pygame.draw.line(surface, c, (cx, cy - 14), (cx, cy - 6), 2)
-    pygame.draw.line(surface, c, (cx, cy + 6), (cx, cy + 14), 2)
+
+    if ads_amount > 0.5:
+        # ADS crosshair: tight dot
+        c = (255, 50, 50)
+        pygame.draw.circle(surface, c, (cx, cy), 2)
+        gap = 3
+        length = 6
+        w = 1
+        pygame.draw.line(surface, c, (cx - length, cy), (cx - gap, cy), w)
+        pygame.draw.line(surface, c, (cx + gap, cy), (cx + length, cy), w)
+        pygame.draw.line(surface, c, (cx, cy - length), (cx, cy - gap), w)
+        pygame.draw.line(surface, c, (cx, cy + gap), (cx, cy + length), w)
+    else:
+        # Normal crosshair
+        c = (0, 255, 0)
+        pygame.draw.line(surface, c, (cx - 14, cy), (cx - 6, cy), 2)
+        pygame.draw.line(surface, c, (cx + 6, cy), (cx + 14, cy), 2)
+        pygame.draw.line(surface, c, (cx, cy - 14), (cx, cy - 6), 2)
+        pygame.draw.line(surface, c, (cx, cy + 6), (cx, cy + 14), 2)
 
 
 def draw_minimap(surface, px, py, pangle, enemies, other_players=None, my_id=0):
-    s, ox, oy = MINIMAP_SCALE, MINIMAP_OFFSET, MINIMAP_OFFSET
+    # Scale minimap to fit max 180px
+    max_px = 180
+    s = max(1, min(MINIMAP_SCALE, max_px // max(MAP_COLS, MAP_ROWS)))
+    ox, oy = MINIMAP_OFFSET, MINIMAP_OFFSET
     pygame.draw.rect(surface, BLACK, (ox - 2, oy - 2, MAP_COLS * s + 4, MAP_ROWS * s + 4))
     for row in range(MAP_ROWS):
         for col in range(MAP_COLS):
@@ -344,11 +522,22 @@ def draw_minimap(surface, px, py, pangle, enemies, other_players=None, my_id=0):
     pygame.draw.line(surface, GREEN, (int(mpx), int(mpy)), (int(mpx + dx), int(mpy + dy)), 1)
 
 
-def draw_hud(surface, font, health, ammo, score):
+def draw_hud(surface, font, health, ammo, score, weapon_id=WPN_PISTOL, enemies_left=None):
     y = SCREEN_HEIGHT - 40
     surface.blit(font.render(f"HP: {health}", True, RED if health < 30 else WHITE), (20, y))
-    surface.blit(font.render(f"AMMO: {ammo}", True, YELLOW), (180, y))
+    wpn = WEAPONS[weapon_id]
+    if wpn["ammo_cost"] > 0:
+        surface.blit(font.render(f"AMMO: {ammo}", True, YELLOW), (180, y))
+    else:
+        surface.blit(font.render("AMMO: --", True, LIGHT_GRAY), (180, y))
+    # Weapon name
+    wname = font.render(f"[{wpn['name'].upper()}]", True, (180, 180, 200))
+    surface.blit(wname, (SCREEN_WIDTH // 2 - wname.get_width() // 2, y))
     surface.blit(font.render(f"SCORE: {score}", True, WHITE), (SCREEN_WIDTH - 200, y))
+    # Enemy counter
+    if enemies_left is not None:
+        ec = font.render(f"ENEMIES: {enemies_left}", True, RED if enemies_left > 0 else GREEN)
+        surface.blit(ec, (SCREEN_WIDTH - 220, y - 30))
 
 
 def draw_damage_overlay(surface, damage_timer):
@@ -372,9 +561,28 @@ def draw_death_screen(surface, font, score):
             center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 30)),
     )
     surface.blit(
-        font.render("Press R to restart or ESC for menu", True, LIGHT_GRAY),
-        font.render("Press R to restart or ESC for menu", True, LIGHT_GRAY).get_rect(
+        font.render("Press R for new dungeon or ESC for menu", True, LIGHT_GRAY),
+        font.render("Press R for new dungeon or ESC for menu", True, LIGHT_GRAY).get_rect(
             center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 70)),
+    )
+
+
+def draw_win_screen(surface, font, score):
+    ov = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    ov.fill((0, 0, 0, 160))
+    surface.blit(ov, (0, 0))
+    big = pygame.font.SysFont("monospace", 56, bold=True)
+    t = big.render("DUNGEON CLEARED!", True, GREEN)
+    surface.blit(t, t.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50)))
+    surface.blit(
+        font.render(f"Score: {score}", True, WHITE),
+        font.render(f"Score: {score}", True, WHITE).get_rect(
+            center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 10)),
+    )
+    surface.blit(
+        font.render("Press R for new dungeon or ESC for menu", True, LIGHT_GRAY),
+        font.render("Press R for new dungeon or ESC for menu", True, LIGHT_GRAY).get_rect(
+            center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 50)),
     )
 
 
@@ -411,6 +619,23 @@ def draw_scoreboard(surface, font, players):
 
 
 # ---------------------------------------------------------------------------
+# Weapon switching helper
+# ---------------------------------------------------------------------------
+def handle_weapon_switch(event, current_weapon):
+    """Check event for weapon switch keys/wheel. Returns new weapon_id or current."""
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_1:
+            return WPN_RIFLE
+        if event.key == pygame.K_2:
+            return WPN_PISTOL
+        if event.key == pygame.K_3:
+            return WPN_KNIFE
+    elif event.type == pygame.MOUSEWHEEL:
+        return (current_weapon + (1 if event.y < 0 else -1)) % NUM_WEAPONS
+    return current_weapon
+
+
+# ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
 class TextInput:
@@ -440,13 +665,154 @@ class TextInput:
         surface.blit(txt, (self.rect.x + 8, self.rect.y + (self.rect.h - txt.get_height()) // 2))
 
 
+def apply_display_mode():
+    """Create/recreate the display with the current settings. Returns new screen surface."""
+    flags = 0
+    if game_settings["fullscreen"]:
+        flags = pygame.FULLSCREEN
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
+    pygame.display.set_caption("Raycaster FPS")
+    return screen
+
+
+def _draw_button(surface, rect, label, font, hovered=False):
+    """Draw a styled menu button."""
+    color = (80, 80, 100) if hovered else (50, 50, 65)
+    pygame.draw.rect(surface, color, rect, border_radius=6)
+    pygame.draw.rect(surface, LIGHT_GRAY, rect, 2, border_radius=6)
+    lbl = font.render(label, True, WHITE)
+    surface.blit(lbl, lbl.get_rect(center=rect.center))
+
+
+def _draw_slider(surface, rect, value, min_val, max_val, label, font):
+    """Draw a horizontal slider. Returns new value if dragged."""
+    # Track
+    track_y = rect.centery
+    pygame.draw.line(surface, LIGHT_GRAY, (rect.x, track_y), (rect.right, track_y), 2)
+    # Fill
+    frac = (value - min_val) / (max_val - min_val)
+    fill_x = rect.x + int(frac * rect.width)
+    pygame.draw.line(surface, GREEN, (rect.x, track_y), (fill_x, track_y), 3)
+    # Handle
+    pygame.draw.circle(surface, WHITE, (fill_x, track_y), 8)
+    pygame.draw.circle(surface, LIGHT_GRAY, (fill_x, track_y), 8, 2)
+    # Label
+    lbl = font.render(label, True, WHITE)
+    surface.blit(lbl, (rect.x, rect.y - 28))
+    # Value text
+    val_text = font.render(f"{value:.3f}", True, LIGHT_GRAY)
+    surface.blit(val_text, (rect.right + 10, rect.y - 5))
+    return frac
+
+
+def options_screen(screen, clock, font):
+    """
+    Options menu. Returns ("back", screen) or ("quit", screen).
+    Screen may be a new surface if display mode changed.
+    """
+    pygame.mouse.set_visible(True)
+    pygame.event.set_grab(False)
+
+    title_font = pygame.font.SysFont("monospace", 36, bold=True)
+    small = pygame.font.SysFont("monospace", 18)
+
+    cx = SCREEN_WIDTH // 2
+
+    # Buttons
+    back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 80, 280, 44)
+    fullscreen_btn = pygame.Rect(cx - 140, 180, 280, 44)
+
+    # Slider rects
+    sens_rect = pygame.Rect(cx - 120, 290, 240, 30)
+
+    dragging_sens = False
+
+    while True:
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_pressed = pygame.mouse.get_pressed()[0]
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return ("quit", screen)
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    return ("back", screen)
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if back_btn.collidepoint(event.pos):
+                    return ("back", screen)
+
+                if fullscreen_btn.collidepoint(event.pos):
+                    game_settings["fullscreen"] = not game_settings["fullscreen"]
+                    screen = apply_display_mode()
+
+                # Start slider drag
+                if sens_rect.inflate(10, 20).collidepoint(event.pos):
+                    dragging_sens = True
+
+            if event.type == pygame.MOUSEBUTTONUP:
+                dragging_sens = False
+
+        # Update slider while dragging
+        if dragging_sens and mouse_pressed:
+            frac = max(0.0, min(1.0, (mouse_pos[0] - sens_rect.x) / sens_rect.width))
+            game_settings["mouse_sensitivity"] = 0.001 + frac * 0.009  # range 0.001 – 0.010
+
+        # --- Draw ---
+        screen.fill((20, 20, 30))
+
+        # Title
+        t = title_font.render("OPTIONS", True, (200, 200, 220))
+        screen.blit(t, t.get_rect(center=(cx, 80)))
+
+        # Separator
+        pygame.draw.line(screen, (50, 50, 65), (cx - 200, 120), (cx + 200, 120), 1)
+
+        # Section: Display
+        screen.blit(font.render("Display", True, (150, 150, 170)), (cx - 140, 145))
+
+        # Fullscreen toggle button
+        fs_label = "Fullscreen: ON" if game_settings["fullscreen"] else "Fullscreen: OFF"
+        fs_hovered = fullscreen_btn.collidepoint(mouse_pos)
+        color = (80, 80, 100) if fs_hovered else (50, 50, 65)
+        pygame.draw.rect(screen, color, fullscreen_btn, border_radius=6)
+        border_color = GREEN if game_settings["fullscreen"] else LIGHT_GRAY
+        pygame.draw.rect(screen, border_color, fullscreen_btn, 2, border_radius=6)
+        lbl = font.render(fs_label, True, GREEN if game_settings["fullscreen"] else WHITE)
+        screen.blit(lbl, lbl.get_rect(center=fullscreen_btn.center))
+
+        # Section: Controls
+        pygame.draw.line(screen, (50, 50, 65), (cx - 200, 248), (cx + 200, 248), 1)
+        screen.blit(font.render("Controls", True, (150, 150, 170)), (cx - 140, 258))
+
+        # Sensitivity slider
+        _draw_slider(
+            screen, sens_rect,
+            game_settings["mouse_sensitivity"],
+            0.001, 0.010,
+            "Mouse Sensitivity",
+            font,
+        )
+
+        # Back button
+        _draw_button(screen, back_btn, "Back", font, back_btn.collidepoint(mouse_pos))
+
+        # Footer hint
+        foot = small.render("ESC to go back", True, DARK_GRAY)
+        screen.blit(foot, foot.get_rect(center=(cx, SCREEN_HEIGHT - 25)))
+
+        pygame.display.flip()
+        clock.tick(30)
+
+
 def menu_screen(screen, clock, font):
     """
     Main menu. Returns one of:
-      ("singleplayer", None, None)
-      ("host", name, None)
-      ("join", name, ip)
-      ("quit", None, None)
+      ("singleplayer", name, None, screen)
+      ("host", name, None, screen)
+      ("join", name, ip, screen)
+      ("options", None, None, screen)
+      ("quit", None, None, screen)
     """
     pygame.mouse.set_visible(True)
     pygame.event.set_grab(False)
@@ -461,9 +827,10 @@ def menu_screen(screen, clock, font):
     ip_input = TextInput(cx - 120, 430, 240, 36, font, "")
 
     buttons = {
-        "single": pygame.Rect(cx - 140, 320, 280, 44),
-        "host":   pygame.Rect(cx - 140, 375, 280, 44),
-        "join":   pygame.Rect(cx - 140, 480, 280, 44),
+        "single":  pygame.Rect(cx - 140, 320, 280, 44),
+        "host":    pygame.Rect(cx - 140, 375, 280, 44),
+        "join":    pygame.Rect(cx - 140, 480, 280, 44),
+        "options": pygame.Rect(cx - 140, 540, 280, 44),
     }
 
     hovered = None
@@ -471,20 +838,22 @@ def menu_screen(screen, clock, font):
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return ("quit", None, None)
+                return ("quit", None, None, screen)
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                return ("quit", None, None)
+                return ("quit", None, None, screen)
 
             name_input.handle_event(event)
             ip_input.handle_event(event)
 
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if buttons["single"].collidepoint(event.pos):
-                    return ("singleplayer", name_input.text or "Player", None)
+                    return ("singleplayer", name_input.text or "Player", None, screen)
                 if buttons["host"].collidepoint(event.pos):
-                    return ("host", name_input.text or "Host", None)
+                    return ("host", name_input.text or "Host", None, screen)
                 if buttons["join"].collidepoint(event.pos) and ip_input.text.strip():
-                    return ("join", name_input.text or "Player", ip_input.text.strip())
+                    return ("join", name_input.text or "Player", ip_input.text.strip(), screen)
+                if buttons["options"].collidepoint(event.pos):
+                    return ("options", None, None, screen)
 
         mouse_pos = pygame.mouse.get_pos()
         hovered = None
@@ -507,19 +876,14 @@ def menu_screen(screen, clock, font):
         name_input.draw(screen)
 
         # Buttons
-        for key, rect in buttons.items():
-            color = (80, 80, 100) if hovered == key else (50, 50, 65)
-            pygame.draw.rect(screen, color, rect, border_radius=6)
-            pygame.draw.rect(screen, LIGHT_GRAY, rect, 2, border_radius=6)
-
         labels = {
-            "single": "Singleplayer",
-            "host": f"Host Game  (your IP: {local_ip})",
-            "join": "Join Game",
+            "single":  "Singleplayer",
+            "host":    f"Host Game  (your IP: {local_ip})",
+            "join":    "Join Game",
+            "options": "Options",
         }
         for key, rect in buttons.items():
-            lbl = font.render(labels[key], True, WHITE)
-            screen.blit(lbl, lbl.get_rect(center=rect.center))
+            _draw_button(screen, rect, labels[key], font, hovered == key)
 
         # IP input (only for join)
         screen.blit(font.render("Host IP Address:", True, WHITE), (cx - 120, 402))
@@ -541,18 +905,24 @@ def singleplayer_loop(screen, clock, font, bg_surface):
     pygame.event.set_grab(True)
 
     def reset():
+        player_spawn, _ = new_dungeon()
         return {
-            "px": 2.0, "py": 2.0, "pangle": 0.0,
+            "px": player_spawn[0], "py": player_spawn[1], "pangle": 0.0,
+            "pitch": 0.0, "ads": 0.0,
             "health": 100, "ammo": 50, "score": 0,
             "enemies": spawn_enemies(),
+            "total_enemies": len(CURRENT_ENEMY_SPAWNS),
             "shooting_timer": 0.0, "damage_timer": 0.0,
             "damage_cooldown": 0.0, "dead": False,
+            "won": False, "weapon": WPN_PISTOL,
         }
 
     st = reset()
+    _game_time = 0.0
 
     while True:
         dt = clock.tick(FPS) / 1000.0
+        _game_time += dt
         shoot = False
 
         for event in pygame.event.get():
@@ -561,23 +931,43 @@ def singleplayer_loop(screen, clock, font, bg_surface):
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return "menu"
-                if event.key == pygame.K_r and st["dead"]:
+                if event.key == pygame.K_r and (st["dead"] or st["won"]):
                     st = reset()
-                if event.key == pygame.K_SPACE and not st["dead"]:
+                if event.key == pygame.K_SPACE and not st["dead"] and not st["won"]:
                     shoot = True
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1 and not st["dead"]:
+                if event.button == 1 and not st["dead"] and not st["won"]:
                     shoot = True
-            elif event.type == pygame.MOUSEMOTION and not st["dead"]:
-                st["pangle"] += event.rel[0] * PLAYER_ROT_SPEED
+            elif event.type == pygame.MOUSEMOTION and not st["dead"] and not st["won"]:
+                sens = game_settings["mouse_sensitivity"]
+                if st["ads"] > 0.1:
+                    sens *= ADS_SENS_MULT
+                st["pangle"] += event.rel[0] * sens
+                st["pitch"] -= event.rel[1] * 0.5 * (ADS_SENS_MULT if st["ads"] > 0.1 else 1.0)
+                st["pitch"] = max(-MAX_PITCH, min(MAX_PITCH, st["pitch"]))
+            if not st["dead"] and not st["won"]:
+                st["weapon"] = handle_weapon_switch(event, st["weapon"])
 
-        if st["dead"]:
-            screen.blit(bg_surface, (0, 0))
+        # ADS (right mouse button held)
+        aiming = pygame.mouse.get_pressed()[2] and not st["dead"] and not st["won"]
+        aiming = aiming and st["weapon"] != WPN_KNIFE  # knife can't ADS
+        target_ads = 1.0 if aiming else 0.0
+        st["ads"] += (target_ads - st["ads"]) * min(1.0, ADS_LERP_SPEED * dt)
+
+        enemies_left = sum(1 for e in st["enemies"] if e.alive)
+        pitch_offset = int(st["pitch"])
+
+        # Frozen screens (dead / won)
+        if st["dead"] or st["won"]:
+            screen.blit(bg_surface, (0, pitch_offset))
             walls = cast_rays(st["px"], st["py"], st["pangle"])
-            draw_walls(screen, walls)
+            draw_walls(screen, walls, pitch_offset)
             wd = [w[1] for w in walls]
-            draw_enemies_from_list(screen, st["enemies"], st["px"], st["py"], st["pangle"], wd)
-            draw_death_screen(screen, font, st["score"])
+            draw_enemies_from_list(screen, st["enemies"], st["px"], st["py"], st["pangle"], wd, _game_time, pitch_offset)
+            if st["dead"]:
+                draw_death_screen(screen, font, st["score"])
+            else:
+                draw_win_screen(screen, font, st["score"])
             pygame.display.flip()
             continue
 
@@ -590,9 +980,10 @@ def singleplayer_loop(screen, clock, font, bg_surface):
         if keys[pygame.K_a]: mx += sa; my -= ca
         if keys[pygame.K_d]: mx -= sa; my += ca
         ln = math.hypot(mx, my)
+        move_speed = PLAYER_SPEED * (0.5 if st["ads"] > 0.5 else 1.0)
         if ln > 0:
-            mx = mx / ln * PLAYER_SPEED * dt
-            my = my / ln * PLAYER_SPEED * dt
+            mx = mx / ln * move_speed * dt
+            my = my / ln * move_speed * dt
         nx, ny = st["px"] + mx, st["py"] + my
         m = PLAYER_SIZE_SCALE
         if not is_wall(nx + m, st["py"]) and not is_wall(nx - m, st["py"]):
@@ -601,35 +992,45 @@ def singleplayer_loop(screen, clock, font, bg_surface):
             st["py"] = ny
 
         # Shooting
+        wpn = WEAPONS[st["weapon"]]
         st["shooting_timer"] = max(0, st["shooting_timer"] - dt)
-        if shoot and st["ammo"] > 0 and st["shooting_timer"] <= 0:
-            st["ammo"] -= 1
-            st["shooting_timer"] = 0.15
+        can_fire = st["shooting_timer"] <= 0
+        has_ammo = wpn["ammo_cost"] == 0 or st["ammo"] >= wpn["ammo_cost"]
+
+        if shoot and can_fire and has_ammo:
+            st["ammo"] -= wpn["ammo_cost"]
+            st["shooting_timer"] = wpn["fire_rate"]
             best, bd = None, float("inf")
             for e in st["enemies"]:
                 if not e.alive:
                     continue
                 dx, dy = e.x - st["px"], e.y - st["py"]
                 d = math.hypot(dx, dy)
+                if d > wpn["range"]:
+                    continue
                 ea = math.atan2(dy, dx)
                 diff = ea - st["pangle"]
                 while diff > math.pi: diff -= 2 * math.pi
                 while diff < -math.pi: diff += 2 * math.pi
-                ht = max(0.05, 0.3 / max(d, 0.1))
+                spread = wpn["spread"] * (0.4 if st["ads"] > 0.5 else 1.0)
+                ht = max(spread, 0.3 / max(d, 0.1))
                 if abs(diff) < ht and d < bd:
                     wd2 = cast_single_ray(st["px"], st["py"], ea)
                     if wd2 > d - 0.3:
                         bd, best = d, e
             if best:
-                best.take_damage()
+                for _ in range(wpn["damage"]):
+                    best.take_damage()
                 if not best.alive:
                     st["score"] += 100
 
         # Enemies
         st["damage_cooldown"] = max(0, st["damage_cooldown"] - dt)
         st["damage_timer"] = max(0, st["damage_timer"] - dt)
+        all_enemies = [(e, e.ai) for e in st["enemies"]]
+        did_shoot = shoot and can_fire and has_ammo
         for e in st["enemies"]:
-            e.update(st["px"], st["py"], dt)
+            e.update(st["px"], st["py"], dt, all_enemies, gunfire=did_shoot)
             if e.alive and math.hypot(e.x - st["px"], e.y - st["py"]) < 0.8 and st["damage_cooldown"] <= 0:
                 st["health"] -= 10
                 st["damage_timer"] = 0.3
@@ -638,20 +1039,21 @@ def singleplayer_loop(screen, clock, font, bg_surface):
                     st["health"] = 0
                     st["dead"] = True
 
-        if all(not e.alive for e in st["enemies"]):
-            st["enemies"] = spawn_enemies()
-            st["ammo"] = min(st["ammo"] + 20, 99)
+        # Win condition: all enemies dead
+        if enemies_left == 0 and not st["won"]:
+            st["won"] = True
 
         # Render
-        screen.blit(bg_surface, (0, 0))
+        screen.fill(FLOOR_BROWN)  # fill gaps when looking up/down
+        screen.blit(bg_surface, (0, pitch_offset))
         walls = cast_rays(st["px"], st["py"], st["pangle"])
-        draw_walls(screen, walls)
+        draw_walls(screen, walls, pitch_offset)
         wd = [w[1] for w in walls]
-        draw_enemies_from_list(screen, st["enemies"], st["px"], st["py"], st["pangle"], wd)
-        draw_weapon(screen, st["shooting_timer"])
-        draw_crosshair(screen)
+        draw_enemies_from_list(screen, st["enemies"], st["px"], st["py"], st["pangle"], wd, _game_time, pitch_offset)
+        draw_weapon(screen, st["shooting_timer"], st["weapon"], st["ads"])
+        draw_crosshair(screen, st["ads"])
         draw_minimap(screen, st["px"], st["py"], st["pangle"], st["enemies"])
-        draw_hud(screen, font, st["health"], st["ammo"], st["score"])
+        draw_hud(screen, font, st["health"], st["ammo"], st["score"], st["weapon"], enemies_left)
         draw_damage_overlay(screen, st["damage_timer"])
         screen.blit(font.render(f"FPS: {int(clock.get_fps())}", True, WHITE), (SCREEN_WIDTH - 150, 10))
         pygame.display.flip()
@@ -659,7 +1061,8 @@ def singleplayer_loop(screen, clock, font, bg_surface):
 
 def host_loop(screen, clock, font, bg_surface, player_name):
     """Host a multiplayer game. Runs a server + plays as player 0."""
-    server = GameServer(WORLD_MAP, spawn_enemies)
+    new_dungeon()  # generate map for multiplayer
+    server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN)
     server.start()
     host_id = server.register_host(player_name)
 
@@ -668,17 +1071,22 @@ def host_loop(screen, clock, font, bg_surface, player_name):
 
     local_ip = get_local_ip()
 
-    px, py, pangle = SPAWN_POSITIONS[0]
+    px, py = CURRENT_PLAYER_SPAWN
     pangle_val = 0.0
+    pitch_val = 0.0
     shooting_timer = 0.0
     damage_timer = 0.0
     prev_health = 100
+    weapon = WPN_PISTOL
+    _game_time = 0.0
 
     result = "menu"
 
     try:
         while True:
             dt = clock.tick(FPS) / 1000.0
+            _game_time += dt
+            pitch_offset = int(pitch_val)
             shoot = False
 
             for event in pygame.event.get():
@@ -693,7 +1101,10 @@ def host_loop(screen, clock, font, bg_surface, player_name):
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     shoot = True
                 elif event.type == pygame.MOUSEMOTION:
-                    pangle_val += event.rel[0] * PLAYER_ROT_SPEED
+                    pangle_val += event.rel[0] * game_settings["mouse_sensitivity"]
+                    pitch_val -= event.rel[1] * 0.5
+                    pitch_val = max(-MAX_PITCH, min(MAX_PITCH, pitch_val))
+                weapon = handle_weapon_switch(event, weapon)
 
             # Movement (client-side, sent to server)
             keys = pygame.key.get_pressed()
@@ -715,13 +1126,14 @@ def host_loop(screen, clock, font, bg_surface, player_name):
             if not is_wall(px, ny + m) and not is_wall(px, ny - m):
                 py = ny
 
+            wpn = WEAPONS[weapon]
             shooting_timer = max(0, shooting_timer - dt)
             actual_shoot = False
             if shoot and shooting_timer <= 0:
-                shooting_timer = 0.15
+                shooting_timer = wpn["fire_rate"]
                 actual_shoot = True
 
-            server.update_host_state(px, py, pangle_val, actual_shoot)
+            server.update_host_state(px, py, pangle_val, actual_shoot, weapon)
             world = server.get_world_state()
 
             # Read own state from server
@@ -743,16 +1155,17 @@ def host_loop(screen, clock, font, bg_surface, player_name):
                 pass
 
             # Render
-            screen.blit(bg_surface, (0, 0))
+            screen.fill(FLOOR_BROWN)
+            screen.blit(bg_surface, (0, pitch_offset))
             walls = cast_rays(px, py, pangle_val)
-            draw_walls(screen, walls)
+            draw_walls(screen, walls, pitch_offset)
             wd = [w[1] for w in walls]
-            draw_enemies_from_list(screen, world["enemies"], px, py, pangle_val, wd)
-            draw_other_players(screen, world["players"], host_id, px, py, pangle_val, wd)
-            draw_weapon(screen, shooting_timer)
+            draw_enemies_from_list(screen, world["enemies"], px, py, pangle_val, wd, _game_time, pitch_offset)
+            draw_other_players(screen, world["players"], host_id, px, py, pangle_val, wd, pitch_offset)
+            draw_weapon(screen, shooting_timer, weapon)
             draw_crosshair(screen)
             draw_minimap(screen, px, py, pangle_val, world["enemies"], world["players"], host_id)
-            draw_hud(screen, font, health, ammo, score)
+            draw_hud(screen, font, health, ammo, score, weapon)
             draw_damage_overlay(screen, damage_timer)
 
             # Connection info
@@ -781,16 +1194,21 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
 
     # We'll start at a default pos and update once we get the welcome
     px, py, pangle_val = 2.0, 2.0, 0.0
+    pitch_val = 0.0
     shooting_timer = 0.0
     damage_timer = 0.0
     prev_health = 100
     connecting_time = 0.0
+    weapon = WPN_PISTOL
+    _game_time = 0.0
 
     result = "menu"
 
     try:
         while True:
             dt = clock.tick(FPS) / 1000.0
+            _game_time += dt
+            pitch_offset = int(pitch_val)
             shoot = False
 
             for event in pygame.event.get():
@@ -805,7 +1223,10 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     shoot = True
                 elif event.type == pygame.MOUSEMOTION:
-                    pangle_val += event.rel[0] * PLAYER_ROT_SPEED
+                    pangle_val += event.rel[0] * game_settings["mouse_sensitivity"]
+                    pitch_val -= event.rel[1] * 0.5
+                    pitch_val = max(-MAX_PITCH, min(MAX_PITCH, pitch_val))
+                weapon = handle_weapon_switch(event, weapon)
 
             client.poll()
 
@@ -843,13 +1264,14 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
             if not is_wall(px, ny + m) and not is_wall(px, ny - m):
                 py = ny
 
+            wpn = WEAPONS[weapon]
             shooting_timer = max(0, shooting_timer - dt)
             actual_shoot = False
             if shoot and shooting_timer <= 0:
-                shooting_timer = 0.15
+                shooting_timer = wpn["fire_rate"]
                 actual_shoot = True
 
-            client.send_state(px, py, pangle_val, actual_shoot)
+            client.send_state(px, py, pangle_val, actual_shoot, weapon)
 
             # Read world state
             world = client.world
@@ -874,16 +1296,17 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
             prev_health = health
 
             # Render
-            screen.blit(bg_surface, (0, 0))
+            screen.fill(FLOOR_BROWN)
+            screen.blit(bg_surface, (0, pitch_offset))
             walls = cast_rays(px, py, pangle_val)
-            draw_walls(screen, walls)
+            draw_walls(screen, walls, pitch_offset)
             wd = [w[1] for w in walls]
-            draw_enemies_from_list(screen, world["enemies"], px, py, pangle_val, wd)
-            draw_other_players(screen, world["players"], client.my_id, px, py, pangle_val, wd)
-            draw_weapon(screen, shooting_timer)
+            draw_enemies_from_list(screen, world["enemies"], px, py, pangle_val, wd, _game_time, pitch_offset)
+            draw_other_players(screen, world["players"], client.my_id, px, py, pangle_val, wd, pitch_offset)
+            draw_weapon(screen, shooting_timer, weapon)
             draw_crosshair(screen)
             draw_minimap(screen, px, py, pangle_val, world["enemies"], world["players"], client.my_id)
-            draw_hud(screen, font, health, ammo, score)
+            draw_hud(screen, font, health, ammo, score, weapon)
             draw_damage_overlay(screen, damage_timer)
 
             n_players = len(world["players"])
@@ -906,19 +1329,25 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
 # ---------------------------------------------------------------------------
 def main():
     pygame.init()
-    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("Raycaster FPS")
+    screen = apply_display_mode()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 24, bold=True)
 
     bg_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
     draw_sky_and_floor(bg_surface)
 
+    load_weapon_sprites()
+    load_enemy_sprites()
+
     while True:
-        choice, name, ip = menu_screen(screen, clock, font)
+        choice, name, ip, screen = menu_screen(screen, clock, font)
 
         if choice == "quit":
             break
+        elif choice == "options":
+            result, screen = options_screen(screen, clock, font)
+            if result == "quit":
+                break
         elif choice == "singleplayer":
             result = singleplayer_loop(screen, clock, font, bg_surface)
             if result == "quit":
