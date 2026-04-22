@@ -72,12 +72,13 @@ def _recv(sock):
 # Server (runs on the host's machine alongside their game client)
 # ---------------------------------------------------------------------------
 class GameServer:
-    def __init__(self, world_map, spawn_enemies_fn, player_spawn=None):
+    def __init__(self, world_map, spawn_enemies_fn, player_spawn=None, host_name="Game"):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", BROADCAST_PORT))
         self.sock.setblocking(False)
 
+        self.host_name = host_name
         self.world_map = world_map
         self.map_rows = len(world_map)
         self.map_cols = len(world_map[0])
@@ -92,6 +93,7 @@ class GameServer:
         self.enemies = []       # list of dicts: {x, y, hp, alive, dmg_timer, target_id}
         self._spawn_enemy_wave()
 
+        self.in_lobby = True    # True = waiting in lobby, False = game running
         self.running = False
         self.thread = None
 
@@ -156,6 +158,17 @@ class GameServer:
                 p["shoot_processed"] = False
             p["last_seen"] = time.time()
 
+    def start_game(self):
+        """Transition from lobby to active game."""
+        self.in_lobby = False
+
+    def get_lobby_players(self):
+        """Return list of player info for lobby display."""
+        return [
+            {"id": pid, "name": p["name"]}
+            for pid, p in sorted(self.players.items())
+        ]
+
     def get_world_state(self):
         """Called by the host's game loop to get the current state for rendering."""
         return self._build_world_packet()
@@ -176,7 +189,7 @@ class GameServer:
              "dt": round(e["dmg_timer"], 2)}
             for e in self.enemies
         ]
-        return {"t": "world", "players": players, "enemies": enemies}
+        return {"t": "world", "players": players, "enemies": enemies, "lobby": self.in_lobby}
 
     def _process_incoming(self):
         for _ in range(100):
@@ -206,6 +219,16 @@ class GameServer:
                         p["shoot"] = True
                         p["shoot_processed"] = False
                     p["last_seen"] = time.time()
+
+            elif msg_type == "ping":
+                # Respond to discovery scan with game info
+                _send(self.sock, {
+                    "t": "pong",
+                    "name": self.host_name,
+                    "ip": get_local_ip(),
+                    "port": BROADCAST_PORT,
+                    "players": len(self.players),
+                }, addr)
 
             elif msg_type == "leave":
                 pid = self.addr_to_id.pop(addr, None)
@@ -331,9 +354,10 @@ class GameServer:
             last_tick = now
 
             self._process_incoming()
-            self._process_shots()
-            self._update_enemies(dt)
-            self._check_wave_respawn()
+            if not self.in_lobby:
+                self._process_shots()
+                self._update_enemies(dt)
+                self._check_wave_respawn()
             self._drop_stale_clients()
             self._broadcast()
 
@@ -354,6 +378,7 @@ class GameClient:
         self.my_id = None
         self.connected = False
         self.world = None  # latest world state from server
+        self.in_lobby = True
 
     def connect(self, host_ip, name="Player"):
         self.server_addr = (host_ip, BROADCAST_PORT)
@@ -377,9 +402,12 @@ class GameClient:
             msg_type = data.get("t")
             if msg_type == "welcome":
                 self.my_id = data["id"]
+                self.spawn_x = data.get("x", 2.0)
+                self.spawn_y = data.get("y", 2.0)
                 self.connected = True
             elif msg_type == "world":
                 self.world = data
+                self.in_lobby = data.get("lobby", False)
 
     def disconnect(self):
         if self.server_addr:
@@ -462,47 +490,126 @@ class DiscoveryBeacon:
             time.sleep(BEACON_INTERVAL)
 
 
+def _get_all_subnet_ips():
+    """Get /24 subnet base IPs for all network interfaces."""
+    subnets = set()
+    try:
+        # Get all IPs on this machine
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127."):
+                continue
+            parts = ip.split(".")
+            if len(parts) == 4:
+                subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+    except OSError:
+        pass
+    # Also try the default route IP
+    try:
+        default_ip = get_local_ip()
+        if not default_ip.startswith("127."):
+            parts = default_ip.split(".")
+            if len(parts) == 4:
+                subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+    except OSError:
+        pass
+    return list(subnets)
+
+
 class DiscoveryListener:
-    """Listens for game beacons via multicast + broadcast."""
+    """Listens for game beacons and actively scans subnets."""
 
     def __init__(self):
+        # Receive socket — listens for beacons and ping replies
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("", DISCOVERY_PORT))
         self.sock.setblocking(False)
 
-        # Join multicast group to receive beacons across ZeroTier/VPN
+        # Join multicast group
         import struct
-        mreq = struct.pack("4sL", socket.inet_aton(MULTICAST_GROUP), socket.INADDR_ANY)
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        try:
+            mreq = struct.pack("4sL", socket.inet_aton(MULTICAST_GROUP), socket.INADDR_ANY)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass
+
+        # Scan socket — sends ping requests to game port on subnet IPs
+        self.scan_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.scan_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.scan_sock.setblocking(False)
 
         self.games = {}  # ip -> {name, ip, port, players, last_seen}
+        self._scan_timer = 0.0
+        self._scan_index = 0
+        self._subnets = _get_all_subnet_ips()
 
-    def poll(self):
-        """Read incoming beacons. Call every frame."""
+    def poll(self, dt=0.033):
+        """Read incoming beacons and scan responses. Call every frame."""
+        # Read from discovery port (beacons)
         for _ in range(20):
             data, addr = _recv(self.sock)
             if data is None:
                 break
             if data.get("t") == "beacon":
                 ip = data.get("ip", addr[0])
-                self.games[ip] = {
-                    "name": data.get("name", "Unknown"),
-                    "ip": ip,
-                    "port": data.get("port", BROADCAST_PORT),
-                    "players": data.get("players", 0),
-                    "last_seen": time.time(),
-                }
+                self._add_game(ip, data)
 
-        # Remove stale entries (not seen for 4 seconds)
+        # Read ping replies on scan socket
+        for _ in range(20):
+            data, addr = _recv(self.scan_sock)
+            if data is None:
+                break
+            if data.get("t") == "pong":
+                ip = data.get("ip", addr[0])
+                self._add_game(ip, data)
+
+        # Active subnet scan — send a few pings per frame
+        self._scan_timer += dt
+        if self._scan_timer >= 2.0:  # scan every 2 seconds
+            self._scan_timer = 0.0
+            self._scan_index = 1  # start scanning from .1
+
+        if self._scan_index > 0 and self._scan_index <= 254:
+            ping = json.dumps({"t": "ping"}, separators=(",", ":")).encode()
+            # Scan a batch of IPs per frame (10 at a time for speed)
+            for _ in range(10):
+                if self._scan_index > 254:
+                    break
+                for subnet in self._subnets:
+                    ip = f"{subnet}.{self._scan_index}"
+                    try:
+                        self.scan_sock.sendto(ping, (ip, BROADCAST_PORT))
+                    except OSError:
+                        pass
+                self._scan_index += 1
+
+        # Remove stale entries
         now = time.time()
-        stale = [ip for ip, g in self.games.items() if now - g["last_seen"] > 4.0]
+        stale = [ip for ip, g in self.games.items() if now - g["last_seen"] > 5.0]
         for ip in stale:
             del self.games[ip]
+
+    def _add_game(self, ip, data):
+        self.games[ip] = {
+            "name": data.get("name", "Unknown"),
+            "ip": ip,
+            "port": data.get("port", BROADCAST_PORT),
+            "players": data.get("players", 0),
+            "last_seen": time.time(),
+        }
 
     def get_games(self):
         """Return list of discovered games, sorted by most recent."""
         return sorted(self.games.values(), key=lambda g: -g["last_seen"])
 
     def stop(self):
-        self.sock.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        try:
+            self.scan_sock.close()
+        except OSError:
+            pass

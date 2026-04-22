@@ -28,6 +28,7 @@ from network import (
 )
 from generate_sprites import generate_all_sprites, sprites_exist
 from generate_enemy_sprites import generate_all_enemy_sprites, enemy_sprites_exist
+from generate_ui_sprites import generate_all_ui_sprites, ui_sprites_exist
 from enemy_ai import EnemyAI, STATE_PATROL, STATE_CHASE, STATE_ATTACK, STATE_RETREAT
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,9 @@ ENEMY_SPRITES = {}   # populated by load_enemy_sprites()
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "weapons")
 ENEMY_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "enemies")
+UI_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ui")
+
+UI_SPRITES = {}  # populated by load_ui_sprites()
 
 
 def load_weapon_sprites():
@@ -429,6 +433,37 @@ def load_enemy_sprites():
         "hit":         _load("drone_hit.png"),
         "wheel":       _load("drone_wheel.png"),
     }
+
+
+def load_ui_sprites():
+    """Load pixel-art UI PNGs, generating if needed."""
+    global UI_SPRITES
+
+    if not ui_sprites_exist(UI_ASSETS_DIR):
+        generate_all_ui_sprites(UI_ASSETS_DIR)
+
+    _load = lambda f: pygame.image.load(os.path.join(UI_ASSETS_DIR, f)).convert_alpha()
+    UI_SPRITES = {
+        "btn_normal":    _load("btn_normal.png"),
+        "btn_hover":     _load("btn_hover.png"),
+        "btn_active":    _load("btn_active.png"),
+        "panel_small":   _load("panel_small.png"),
+        "panel_large":   _load("panel_large.png"),
+        "input_field":   _load("input_field.png"),
+        "input_active":  _load("input_active.png"),
+        "title_bg":      _load("title_bg.png"),
+        "health_bar_bg": _load("health_bar_bg.png"),
+        "lobby_row":     _load("lobby_row.png"),
+    }
+
+
+# Pixel-art font helper — small sizes with no anti-aliasing for crisp pixel look
+def _pixel_font(size=16):
+    return pygame.font.SysFont("monospace", size, bold=True)
+
+
+def _pixel_text(font, text, color, antialias=False):
+    return font.render(text, antialias, color)
 
 
 def draw_weapon(surface, shooting_timer, weapon_id=WPN_PISTOL, ads_amount=0.0):
@@ -640,12 +675,13 @@ def handle_weapon_switch(event, current_weapon):
 # Menu
 # ---------------------------------------------------------------------------
 class TextInput:
-    """Simple single-line text input widget."""
+    """Pixel-art styled text input widget."""
     def __init__(self, x, y, w, h, font, default=""):
         self.rect = pygame.Rect(x, y, w, h)
         self.font = font
         self.text = default
         self.active = False
+        self._cursor_timer = 0.0
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
@@ -658,12 +694,22 @@ class TextInput:
             elif len(self.text) < 30 and event.unicode.isprintable():
                 self.text += event.unicode
 
-    def draw(self, surface):
-        border_color = WHITE if self.active else LIGHT_GRAY
-        pygame.draw.rect(surface, DARK_GRAY, self.rect)
-        pygame.draw.rect(surface, border_color, self.rect, 2)
-        txt = self.font.render(self.text, True, WHITE)
+    def draw(self, surface, dt=0.033):
+        self._cursor_timer += dt
+        if UI_SPRITES:
+            key = "input_active" if self.active else "input_field"
+            img = pygame.transform.scale(UI_SPRITES[key], (self.rect.width, self.rect.height))
+            surface.blit(img, self.rect.topleft)
+        else:
+            border_color = WHITE if self.active else LIGHT_GRAY
+            pygame.draw.rect(surface, DARK_GRAY, self.rect)
+            pygame.draw.rect(surface, border_color, self.rect, 2)
+        txt = _pixel_text(self.font, self.text, WHITE) if UI_SPRITES else self.font.render(self.text, True, WHITE)
         surface.blit(txt, (self.rect.x + 8, self.rect.y + (self.rect.h - txt.get_height()) // 2))
+        # Blinking cursor
+        if self.active and int(self._cursor_timer * 2) % 2 == 0:
+            cx = self.rect.x + 10 + txt.get_width()
+            pygame.draw.rect(surface, WHITE, (cx, self.rect.y + 8, 2, self.rect.h - 16))
 
 
 def apply_display_mode():
@@ -676,12 +722,18 @@ def apply_display_mode():
     return screen
 
 
-def _draw_button(surface, rect, label, font, hovered=False):
-    """Draw a styled menu button."""
-    color = (80, 80, 100) if hovered else (50, 50, 65)
-    pygame.draw.rect(surface, color, rect, border_radius=6)
-    pygame.draw.rect(surface, LIGHT_GRAY, rect, 2, border_radius=6)
-    lbl = font.render(label, True, WHITE)
+def _draw_button(surface, rect, label, font, hovered=False, active=False):
+    """Draw a pixel-art styled button."""
+    if UI_SPRITES:
+        key = "btn_active" if active else ("btn_hover" if hovered else "btn_normal")
+        btn_img = UI_SPRITES[key]
+        scaled = pygame.transform.scale(btn_img, (rect.width, rect.height))
+        surface.blit(scaled, rect.topleft)
+    else:
+        color = (60, 65, 90) if hovered else (45, 48, 65)
+        pygame.draw.rect(surface, color, rect)
+        pygame.draw.rect(surface, (90, 95, 120), rect, 2)
+    lbl = _pixel_text(font, label, WHITE) if UI_SPRITES else font.render(label, True, WHITE)
     surface.blit(lbl, lbl.get_rect(center=rect.center))
 
 
@@ -806,163 +858,429 @@ def options_screen(screen, clock, font):
         clock.tick(30)
 
 
+def _draw_menu_bg(screen):
+    """Dark background with subtle pixel grid pattern."""
+    screen.fill((16, 18, 26))
+    # Subtle grid
+    for x in range(0, SCREEN_WIDTH, 32):
+        pygame.draw.line(screen, (20, 22, 30), (x, 0), (x, SCREEN_HEIGHT))
+    for y in range(0, SCREEN_HEIGHT, 32):
+        pygame.draw.line(screen, (20, 22, 30), (0, y), (SCREEN_WIDTH, y))
+
+
 def menu_screen(screen, clock, font):
     """
-    Main menu with LAN server browser.
-    Returns one of:
+    Main menu. Returns one of:
       ("singleplayer", name, None, screen)
-      ("host", name, None, screen)
-      ("join", name, ip, screen)
+      ("multiplayer", name, None, screen)
       ("options", None, None, screen)
       ("quit", None, None, screen)
     """
     pygame.mouse.set_visible(True)
     pygame.event.set_grab(False)
 
-    title_font = pygame.font.SysFont("monospace", 48, bold=True)
-    small = pygame.font.SysFont("monospace", 18)
-
-    local_ip = get_local_ip()
+    title_font = _pixel_font(48)
+    sub_font = _pixel_font(18)
 
     cx = SCREEN_WIDTH // 2
-    name_input = TextInput(cx - 120, 250, 240, 36, font, "Player")
-    ip_input = TextInput(cx - 120, 560, 240, 36, font, "")
+    name_input = TextInput(cx - 120, 270, 240, 36, _pixel_font(20), "Player")
 
     buttons = {
-        "single":  pygame.Rect(cx - 140, 320, 280, 44),
-        "host":    pygame.Rect(cx - 140, 375, 280, 44),
-        "options": pygame.Rect(cx - 140, 615, 280, 44),
-        "join_manual": pygame.Rect(cx + 130, 556, 100, 40),
+        "single":      pygame.Rect(cx - 140, 340, 280, 44),
+        "multiplayer": pygame.Rect(cx - 140, 400, 280, 44),
+        "options":     pygame.Rect(cx - 140, 460, 280, 44),
+        "quit":        pygame.Rect(cx - 140, 520, 280, 44),
     }
 
-    # Server browser area
-    browser_rect = pygame.Rect(cx - 200, 440, 400, 110)
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return ("quit", None, None, screen)
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return ("quit", None, None, screen)
+            name_input.handle_event(event)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for key, rect in buttons.items():
+                    if rect.collidepoint(event.pos):
+                        name = name_input.text or "Player"
+                        if key == "single":
+                            return ("singleplayer", name, None, screen)
+                        elif key == "multiplayer":
+                            return ("multiplayer", name, None, screen)
+                        elif key == "options":
+                            return ("options", None, None, screen)
+                        elif key == "quit":
+                            return ("quit", None, None, screen)
 
-    # Start listening for LAN games
+        mouse_pos = pygame.mouse.get_pos()
+        _draw_menu_bg(screen)
+
+        # Title
+        if UI_SPRITES:
+            tbg = UI_SPRITES["title_bg"]
+            screen.blit(tbg, (cx - tbg.get_width() // 2, 60))
+        t = _pixel_text(title_font, "RAYCASTER  FPS", (180, 185, 210))
+        screen.blit(t, t.get_rect(center=(cx, 100)))
+        sub = _pixel_text(sub_font, "COMBAT  DRONE  EDITION", (80, 85, 110))
+        screen.blit(sub, sub.get_rect(center=(cx, 140)))
+
+        # Decorative line
+        pygame.draw.line(screen, (50, 55, 75), (cx - 160, 170), (cx + 160, 170), 2)
+
+        # Name input
+        screen.blit(_pixel_text(_pixel_font(16), "CALL SIGN:", (120, 125, 150)), (cx - 120, 248))
+        name_input.draw(screen)
+
+        # Buttons
+        labels = {"single": "SINGLEPLAYER", "multiplayer": "MULTIPLAYER",
+                  "options": "OPTIONS", "quit": "QUIT"}
+        for key, rect in buttons.items():
+            hov = rect.collidepoint(mouse_pos)
+            _draw_button(screen, rect, labels[key], _pixel_font(20), hov)
+
+        # Version
+        screen.blit(_pixel_text(sub_font, "v0.2", (40, 42, 55)), (10, SCREEN_HEIGHT - 24))
+
+        pygame.display.flip()
+        clock.tick(30)
+
+
+def multiplayer_screen(screen, clock, font):
+    """
+    Multiplayer submenu — Host, Browse/Join, Back.
+    Returns one of:
+      ("host", name, None, screen)
+      ("join", name, ip, screen)
+      ("back", None, None, screen)
+      ("quit", None, None, screen)
+    """
+    pygame.mouse.set_visible(True)
+    pygame.event.set_grab(False)
+
+    title_font = _pixel_font(36)
+    sub_font = _pixel_font(18)
+    row_font = _pixel_font(16)
+
+    local_ip = get_local_ip()
+    cx = SCREEN_WIDTH // 2
+
+    ip_input = TextInput(cx - 120, 570, 240, 36, _pixel_font(20), "")
+
+    host_btn = pygame.Rect(cx - 140, 130, 280, 44)
+    join_manual_btn = pygame.Rect(cx + 130, 566, 100, 40)
+    back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
+
+    browser_rect = pygame.Rect(cx - 220, 200, 440, 340)
+    selected_game = None
+
     listener = DiscoveryListener()
-    selected_game = None  # ip of selected game in browser
-
-    hovered = None
 
     try:
         while True:
-            listener.poll()
+            listener.poll(1.0 / 30)
             games = listener.get_games()
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     return ("quit", None, None, screen)
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    return ("quit", None, None, screen)
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return ("back", None, None, screen)
+                    if event.key == pygame.K_RETURN and selected_game:
+                        return ("join", None, selected_game, screen)
 
-                name_input.handle_event(event)
                 ip_input.handle_event(event)
 
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if buttons["single"].collidepoint(event.pos):
-                        return ("singleplayer", name_input.text or "Player", None, screen)
-                    if buttons["host"].collidepoint(event.pos):
-                        return ("host", name_input.text or "Host", None, screen)
-                    if buttons["options"].collidepoint(event.pos):
-                        return ("options", None, None, screen)
-                    # Manual IP join
-                    if buttons["join_manual"].collidepoint(event.pos) and ip_input.text.strip():
-                        return ("join", name_input.text or "Player", ip_input.text.strip(), screen)
+                    if host_btn.collidepoint(event.pos):
+                        return ("host", None, None, screen)
+                    if back_btn.collidepoint(event.pos):
+                        return ("back", None, None, screen)
+                    if join_manual_btn.collidepoint(event.pos) and ip_input.text.strip():
+                        return ("join", None, ip_input.text.strip(), screen)
 
-                    # Click on a game in the browser list
+                    # Click server browser rows
                     if browser_rect.collidepoint(event.pos):
-                        gy = event.pos[1] - browser_rect.y
-                        idx = gy // 28
+                        gy = event.pos[1] - (browser_rect.y + 30)
+                        idx = gy // 34
                         if 0 <= idx < len(games):
                             selected_game = games[idx]["ip"]
 
+                # Double-click to join
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    # Double-click or select+join: if a game is selected, join on click
-                    pass
-
-                # Join selected game on Enter or double-click
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
-                    if selected_game:
-                        return ("join", name_input.text or "Player", selected_game, screen)
+                    if selected_game and browser_rect.collidepoint(event.pos):
+                        gy = event.pos[1] - (browser_rect.y + 30)
+                        idx = gy // 34
+                        if 0 <= idx < len(games) and games[idx]["ip"] == selected_game:
+                            return ("join", None, selected_game, screen)
 
             mouse_pos = pygame.mouse.get_pos()
-            hovered = None
-            for key, rect in buttons.items():
-                if rect.collidepoint(mouse_pos):
-                    hovered = key
-
-            screen.fill((20, 20, 30))
+            _draw_menu_bg(screen)
 
             # Title
-            t = title_font.render("RAYCASTER FPS", True, (200, 200, 220))
-            screen.blit(t, t.get_rect(center=(cx, 100)))
+            t = _pixel_text(title_font, "MULTIPLAYER", (180, 185, 210))
+            screen.blit(t, t.get_rect(center=(cx, 60)))
+            pygame.draw.line(screen, (50, 55, 75), (cx - 140, 85), (cx + 140, 85), 2)
 
-            # Subtitle
-            sub = small.render("LAN Multiplayer", True, LIGHT_GRAY)
-            screen.blit(sub, sub.get_rect(center=(cx, 150)))
+            # Host button
+            _draw_button(screen, host_btn, f"HOST GAME ({local_ip})", _pixel_font(18),
+                         host_btn.collidepoint(mouse_pos))
 
-            # Name label + input
-            screen.blit(font.render("Your Name:", True, WHITE), (cx - 120, 222))
-            name_input.draw(screen)
+            # --- Server Browser Panel ---
+            if UI_SPRITES:
+                panel = pygame.transform.scale(UI_SPRITES["panel_small"],
+                                               (browser_rect.width, browser_rect.height))
+                screen.blit(panel, browser_rect.topleft)
+            else:
+                pygame.draw.rect(screen, (25, 27, 38), browser_rect)
+                pygame.draw.rect(screen, (60, 65, 85), browser_rect, 1)
 
-            # Top buttons
-            _draw_button(screen, buttons["single"], "Singleplayer", font, hovered == "single")
-            _draw_button(screen, buttons["host"], f"Host Game  ({local_ip})", font, hovered == "host")
-
-            # --- Server Browser ---
-            screen.blit(font.render("LAN Games:", True, (150, 150, 170)), (browser_rect.x, browser_rect.y - 25))
-
-            # Browser background
-            pygame.draw.rect(screen, (30, 30, 40), browser_rect)
-            pygame.draw.rect(screen, (60, 60, 75), browser_rect, 1)
+            screen.blit(_pixel_text(row_font, "LAN GAMES", (100, 105, 130)),
+                        (browser_rect.x + 10, browser_rect.y + 8))
 
             if games:
-                for i, game in enumerate(games[:3]):  # max 3 visible
-                    gy = browser_rect.y + i * 28 + 4
-                    row_rect = pygame.Rect(browser_rect.x + 2, gy, browser_rect.width - 4, 26)
+                for i, game in enumerate(games[:8]):
+                    gy = browser_rect.y + 30 + i * 34
+                    row_rect = pygame.Rect(browser_rect.x + 6, gy, browser_rect.width - 12, 30)
 
-                    # Highlight selected
+                    # Row background
+                    if UI_SPRITES:
+                        row_bg = pygame.transform.scale(UI_SPRITES["lobby_row"],
+                                                        (row_rect.width, row_rect.height))
+                        screen.blit(row_bg, row_rect.topleft)
+
                     if game["ip"] == selected_game:
-                        pygame.draw.rect(screen, (50, 70, 100), row_rect, border_radius=3)
+                        pygame.draw.rect(screen, (40, 65, 95), row_rect)
+                        pygame.draw.rect(screen, (80, 120, 180), row_rect, 1)
                     elif row_rect.collidepoint(mouse_pos):
-                        pygame.draw.rect(screen, (40, 50, 70), row_rect, border_radius=3)
+                        pygame.draw.rect(screen, (35, 45, 65), row_rect)
 
-                    # Game info
-                    name_txt = small.render(game["name"][:24], True, WHITE)
-                    screen.blit(name_txt, (row_rect.x + 8, gy + 4))
+                    screen.blit(_pixel_text(row_font, game["name"][:22], WHITE),
+                                (row_rect.x + 8, gy + 6))
+                    info = f"{game['ip']}  {game['players']}P"
+                    it = _pixel_text(row_font, info, LIGHT_GRAY)
+                    screen.blit(it, (row_rect.right - it.get_width() - 8, gy + 6))
 
-                    info_txt = small.render(
-                        f"{game['ip']}  ({game['players']} player{'s' if game['players'] != 1 else ''})",
-                        True, LIGHT_GRAY,
-                    )
-                    screen.blit(info_txt, (row_rect.right - info_txt.get_width() - 8, gy + 4))
-
-                # Join selected button
+                # Join button
                 if selected_game:
-                    join_btn = pygame.Rect(browser_rect.right - 110, browser_rect.bottom + 4, 110, 32)
-                    _draw_button(screen, join_btn, "Join", font, join_btn.collidepoint(mouse_pos))
-                    if pygame.mouse.get_pressed()[0] and join_btn.collidepoint(mouse_pos):
-                        return ("join", name_input.text or "Player", selected_game, screen)
+                    jb = pygame.Rect(browser_rect.right - 120, browser_rect.bottom - 40, 110, 34)
+                    _draw_button(screen, jb, "JOIN", _pixel_font(18), jb.collidepoint(mouse_pos))
+                    if pygame.mouse.get_pressed()[0] and jb.collidepoint(mouse_pos):
+                        return ("join", None, selected_game, screen)
             else:
-                no_games = small.render("Searching for games on LAN...", True, DARK_GRAY)
-                screen.blit(no_games, no_games.get_rect(center=browser_rect.center))
+                nt = _pixel_text(sub_font, "Scanning for games...", (50, 52, 65))
+                screen.blit(nt, nt.get_rect(center=browser_rect.center))
 
-            # Manual IP input
-            screen.blit(small.render("Or enter IP manually:", True, LIGHT_GRAY), (cx - 120, 543))
+            # Manual IP
+            screen.blit(_pixel_text(row_font, "OR ENTER IP:", (80, 85, 110)), (cx - 120, 552))
             ip_input.draw(screen)
-            _draw_button(screen, buttons["join_manual"], "Join", font, hovered == "join_manual")
+            _draw_button(screen, join_manual_btn, "JOIN", _pixel_font(16),
+                         join_manual_btn.collidepoint(mouse_pos))
 
-            # Options
-            _draw_button(screen, buttons["options"], "Options", font, hovered == "options")
-
-            # Footer
-            foot = small.render("ESC to quit", True, DARK_GRAY)
-            screen.blit(foot, foot.get_rect(center=(cx, SCREEN_HEIGHT - 20)))
+            # Back
+            _draw_button(screen, back_btn, "BACK", _pixel_font(20),
+                         back_btn.collidepoint(mouse_pos))
 
             pygame.display.flip()
             clock.tick(30)
     finally:
         listener.stop()
+
+
+def lobby_screen(screen, clock, font, server, beacon, player_name):
+    """
+    Host lobby — waits for players, shows connected list.
+    Returns "start" when host clicks Start, "quit" to exit, "back" to cancel.
+    """
+    pygame.mouse.set_visible(True)
+    pygame.event.set_grab(False)
+
+    title_font = _pixel_font(32)
+    row_font = _pixel_font(18)
+    sub_font = _pixel_font(16)
+    local_ip = get_local_ip()
+    cx = SCREEN_WIDTH // 2
+
+    start_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 130, 280, 48)
+    back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
+    panel_rect = pygame.Rect(cx - 230, 160, 460, 380)
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return "quit"
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    return "back"
+                if event.key == pygame.K_RETURN:
+                    return "start"
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if start_btn.collidepoint(event.pos):
+                    return "start"
+                if back_btn.collidepoint(event.pos):
+                    return "back"
+
+        mouse_pos = pygame.mouse.get_pos()
+        _draw_menu_bg(screen)
+
+        # Title
+        t = _pixel_text(title_font, "GAME LOBBY", (180, 185, 210))
+        screen.blit(t, t.get_rect(center=(cx, 50)))
+        info = _pixel_text(sub_font, f"HOSTING ON {local_ip}", GREEN)
+        screen.blit(info, info.get_rect(center=(cx, 85)))
+        pygame.draw.line(screen, (50, 55, 75), (cx - 160, 110), (cx + 160, 110), 2)
+
+        # Waiting message
+        msg = _pixel_text(sub_font, "Waiting for players to join...", (80, 85, 110))
+        screen.blit(msg, msg.get_rect(center=(cx, 135)))
+
+        # Player list panel
+        if UI_SPRITES:
+            panel = pygame.transform.scale(UI_SPRITES["panel_large"],
+                                           (panel_rect.width, panel_rect.height))
+            screen.blit(panel, panel_rect.topleft)
+        else:
+            pygame.draw.rect(screen, (22, 24, 35), panel_rect)
+            pygame.draw.rect(screen, (60, 65, 85), panel_rect, 1)
+
+        screen.blit(_pixel_text(sub_font, "CONNECTED PLAYERS", (100, 105, 130)),
+                    (panel_rect.x + 14, panel_rect.y + 10))
+
+        players = server.get_lobby_players()
+        for i, p in enumerate(players[:10]):
+            py_pos = panel_rect.y + 38 + i * 34
+            row_rect = pygame.Rect(panel_rect.x + 8, py_pos, panel_rect.width - 16, 30)
+
+            if UI_SPRITES:
+                row_bg = pygame.transform.scale(UI_SPRITES["lobby_row"],
+                                                (row_rect.width, row_rect.height))
+                screen.blit(row_bg, row_rect.topleft)
+            else:
+                pygame.draw.rect(screen, (30, 33, 48), row_rect)
+                pygame.draw.rect(screen, (50, 55, 72), row_rect, 1)
+
+            # Player color dot
+            pc = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
+            pygame.draw.circle(screen, pc, (row_rect.x + 16, py_pos + 15), 6)
+            pygame.draw.circle(screen, BLACK, (row_rect.x + 16, py_pos + 15), 6, 1)
+
+            # Name
+            screen.blit(_pixel_text(row_font, p["name"][:20], WHITE),
+                        (row_rect.x + 30, py_pos + 5))
+
+            # Host badge
+            if p["id"] == 0:
+                badge = _pixel_text(sub_font, "HOST", YELLOW)
+                screen.blit(badge, (row_rect.right - badge.get_width() - 10, py_pos + 7))
+
+        # Player count
+        count_txt = _pixel_text(row_font, f"{len(players)} / 4", LIGHT_GRAY)
+        screen.blit(count_txt, (panel_rect.right - count_txt.get_width() - 14, panel_rect.y + 10))
+
+        # Buttons
+        can_start = len(players) >= 1
+        if can_start:
+            _draw_button(screen, start_btn, "START GAME", _pixel_font(22),
+                         start_btn.collidepoint(mouse_pos), active=True)
+        else:
+            _draw_button(screen, start_btn, "WAITING...", _pixel_font(22), False)
+
+        _draw_button(screen, back_btn, "CANCEL", _pixel_font(20),
+                     back_btn.collidepoint(mouse_pos))
+
+        pygame.display.flip()
+        clock.tick(30)
+
+
+def client_lobby_screen(screen, clock, font, client, host_ip):
+    """
+    Client lobby — waits for host to start.
+    Returns "start" when game begins, "quit" to exit, "back" to cancel.
+    """
+    pygame.mouse.set_visible(True)
+    pygame.event.set_grab(False)
+
+    title_font = _pixel_font(32)
+    row_font = _pixel_font(18)
+    sub_font = _pixel_font(16)
+    cx = SCREEN_WIDTH // 2
+
+    back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
+    panel_rect = pygame.Rect(cx - 230, 160, 460, 380)
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return "quit"
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return "back"
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if back_btn.collidepoint(event.pos):
+                    return "back"
+
+        client.poll()
+
+        # Check if game started
+        if client.connected and not client.in_lobby:
+            return "start"
+
+        mouse_pos = pygame.mouse.get_pos()
+        _draw_menu_bg(screen)
+
+        # Title
+        t = _pixel_text(title_font, "GAME LOBBY", (180, 185, 210))
+        screen.blit(t, t.get_rect(center=(cx, 50)))
+        info = _pixel_text(sub_font, f"CONNECTED TO {host_ip}", BLUE)
+        screen.blit(info, info.get_rect(center=(cx, 85)))
+        pygame.draw.line(screen, (50, 55, 75), (cx - 160, 110), (cx + 160, 110), 2)
+
+        if not client.connected:
+            msg = _pixel_text(sub_font, "Connecting...", YELLOW)
+            screen.blit(msg, msg.get_rect(center=(cx, 135)))
+        else:
+            msg = _pixel_text(sub_font, "Waiting for host to start...", (80, 85, 110))
+            screen.blit(msg, msg.get_rect(center=(cx, 135)))
+
+        # Player list panel
+        if UI_SPRITES:
+            panel = pygame.transform.scale(UI_SPRITES["panel_large"],
+                                           (panel_rect.width, panel_rect.height))
+            screen.blit(panel, panel_rect.topleft)
+        else:
+            pygame.draw.rect(screen, (22, 24, 35), panel_rect)
+            pygame.draw.rect(screen, (60, 65, 85), panel_rect, 1)
+
+        screen.blit(_pixel_text(sub_font, "PLAYERS", (100, 105, 130)),
+                    (panel_rect.x + 14, panel_rect.y + 10))
+
+        if client.world:
+            players = client.world.get("players", {})
+            for i, (pid_str, p) in enumerate(sorted(players.items())):
+                pid = int(pid_str)
+                py_pos = panel_rect.y + 38 + i * 34
+                row_rect = pygame.Rect(panel_rect.x + 8, py_pos, panel_rect.width - 16, 30)
+
+                if UI_SPRITES:
+                    row_bg = pygame.transform.scale(UI_SPRITES["lobby_row"],
+                                                    (row_rect.width, row_rect.height))
+                    screen.blit(row_bg, row_rect.topleft)
+                else:
+                    pygame.draw.rect(screen, (30, 33, 48), row_rect)
+
+                pc = PLAYER_COLORS[pid % len(PLAYER_COLORS)]
+                pygame.draw.circle(screen, pc, (row_rect.x + 16, py_pos + 15), 6)
+                screen.blit(_pixel_text(row_font, p.get("name", f"Player {pid}")[:20], WHITE),
+                            (row_rect.x + 30, py_pos + 5))
+                if pid == 0:
+                    badge = _pixel_text(sub_font, "HOST", YELLOW)
+                    screen.blit(badge, (row_rect.right - badge.get_width() - 10, py_pos + 7))
+
+        # Back
+        _draw_button(screen, back_btn, "DISCONNECT", _pixel_font(20),
+                     back_btn.collidepoint(mouse_pos))
+
+        pygame.display.flip()
+        clock.tick(30)
 
 
 # ---------------------------------------------------------------------------
@@ -1127,19 +1445,21 @@ def singleplayer_loop(screen, clock, font, bg_surface):
         pygame.display.flip()
 
 
-def host_loop(screen, clock, font, bg_surface, player_name):
+def host_loop(screen, clock, font, bg_surface, player_name, server=None, beacon=None):
     """Host a multiplayer game. Runs a server + plays as player 0."""
-    new_dungeon()  # generate map for multiplayer
-    server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN)
-    server.start()
-    host_id = server.register_host(player_name)
+    if server is None:
+        # Legacy path: create server inline (no lobby)
+        new_dungeon()
+        game_name = f"{player_name}'s Game"
+        server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN, host_name=game_name)
+        server.start()
+        server.register_host(player_name)
+        server.start_game()
+    if beacon is None:
+        beacon = DiscoveryBeacon(f"{player_name}'s Game", lambda: len(server.players))
+        beacon.start()
 
-    # Start LAN discovery beacon
-    beacon = DiscoveryBeacon(
-        host_name=f"{player_name}'s Game",
-        player_count_fn=lambda: len(server.players),
-    )
-    beacon.start()
+    host_id = 0  # host is always player 0
 
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
@@ -1260,10 +1580,11 @@ def host_loop(screen, clock, font, bg_surface, player_name):
         server.stop()
 
 
-def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
+def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None):
     """Join a multiplayer game as a client."""
-    client = GameClient()
-    client.connect(host_ip, player_name)
+    if client is None:
+        client = GameClient()
+        client.connect(host_ip, player_name)
 
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
@@ -1305,6 +1626,11 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip):
                 weapon = handle_weapon_switch(event, weapon)
 
             client.poll()
+
+            # Use spawn position from server once connected
+            if client.connected and hasattr(client, 'spawn_x') and px == 2.0 and py == 2.0:
+                px = client.spawn_x
+                py = client.spawn_y
 
             # Retry connection
             if not client.connected:
@@ -1414,28 +1740,80 @@ def main():
 
     load_weapon_sprites()
     load_enemy_sprites()
+    load_ui_sprites()
+
+    player_name = "Player"
 
     while True:
         choice, name, ip, screen = menu_screen(screen, clock, font)
+        if name:
+            player_name = name
 
         if choice == "quit":
             break
+
         elif choice == "options":
             result, screen = options_screen(screen, clock, font)
             if result == "quit":
                 break
+
         elif choice == "singleplayer":
             result = singleplayer_loop(screen, clock, font, bg_surface)
             if result == "quit":
                 break
-        elif choice == "host":
-            result = host_loop(screen, clock, font, bg_surface, name)
-            if result == "quit":
+
+        elif choice == "multiplayer":
+            # Multiplayer submenu
+            mp_result, _, mp_ip, screen = multiplayer_screen(screen, clock, font)
+
+            if mp_result == "quit":
                 break
-        elif choice == "join":
-            result = join_loop(screen, clock, font, bg_surface, name, ip)
-            if result == "quit":
-                break
+            elif mp_result == "back":
+                continue
+            elif mp_result == "host":
+                # Create server + beacon, show lobby
+                new_dungeon()
+                game_name = f"{player_name}'s Game"
+                server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN,
+                                    host_name=game_name)
+                server.start()
+                server.register_host(player_name)
+                beacon = DiscoveryBeacon(game_name, lambda: len(server.players))
+                beacon.start()
+
+                lobby_result = lobby_screen(screen, clock, font, server, beacon, player_name)
+
+                if lobby_result == "start":
+                    server.start_game()
+                    result = host_loop(screen, clock, font, bg_surface, player_name,
+                                       server=server, beacon=beacon)
+                    if result == "quit":
+                        break
+                elif lobby_result == "quit":
+                    beacon.stop()
+                    server.stop()
+                    break
+                else:  # back
+                    beacon.stop()
+                    server.stop()
+
+            elif mp_result == "join":
+                # Connect to server, show client lobby
+                client = GameClient()
+                client.connect(mp_ip, player_name)
+
+                lobby_result = client_lobby_screen(screen, clock, font, client, mp_ip)
+
+                if lobby_result == "start":
+                    result = join_loop(screen, clock, font, bg_surface, player_name,
+                                       mp_ip, client=client)
+                    if result == "quit":
+                        break
+                elif lobby_result == "quit":
+                    client.disconnect()
+                    break
+                else:  # back
+                    client.disconnect()
 
     pygame.mouse.set_visible(True)
     pygame.event.set_grab(False)
