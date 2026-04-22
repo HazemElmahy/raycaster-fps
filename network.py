@@ -491,21 +491,22 @@ class DiscoveryBeacon:
 
 
 def _get_all_subnet_ips():
-    """Get /24 subnet base IPs for all network interfaces."""
+    """Get /24 subnet base IPs for all network interfaces (including ZeroTier/VPN)."""
     subnets = set()
+
+    # Method 1: getaddrinfo
     try:
-        # Get all IPs on this machine
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
             ip = info[4][0]
-            if ip.startswith("127."):
-                continue
-            parts = ip.split(".")
-            if len(parts) == 4:
-                subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+            if not ip.startswith("127."):
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
     except OSError:
         pass
-    # Also try the default route IP
+
+    # Method 2: default route
     try:
         default_ip = get_local_ip()
         if not default_ip.startswith("127."):
@@ -514,6 +515,35 @@ def _get_all_subnet_ips():
                 subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
     except OSError:
         pass
+
+    # Method 3: parse all interface IPs from /proc (Linux — catches ZeroTier)
+    import subprocess
+    try:
+        out = subprocess.check_output(["ip", "-4", "addr"], timeout=2, stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("inet "):
+                ip = line.split()[1].split("/")[0]
+                if not ip.startswith("127."):
+                    parts = ip.split(".")
+                    if len(parts) == 4:
+                        subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+    except Exception:
+        pass
+
+    # Method 4: ipconfig on Windows
+    try:
+        out = subprocess.check_output(["ipconfig"], timeout=2, stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            if "IPv4" in line and ":" in line:
+                ip = line.split(":")[-1].strip()
+                if not ip.startswith("127."):
+                    parts = ip.split(".")
+                    if len(parts) == 4:
+                        subnets.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
+    except Exception:
+        pass
+
     return list(subnets)
 
 

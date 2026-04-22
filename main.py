@@ -689,6 +689,17 @@ class TextInput:
         elif event.type == pygame.KEYDOWN and self.active:
             if event.key == pygame.K_BACKSPACE:
                 self.text = self.text[:-1]
+            elif event.key == pygame.K_v and (event.mod & pygame.KMOD_CTRL):
+                # Ctrl+V paste from clipboard
+                try:
+                    clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+                    if clip:
+                        pasted = clip.decode("utf-8").rstrip("\x00").strip()
+                        self.text = (self.text + pasted)[:30]
+                except Exception:
+                    pass
+            elif event.key == pygame.K_a and (event.mod & pygame.KMOD_CTRL):
+                pass  # Ctrl+A select all (no-op, prevent typing 'a')
             elif event.key in (pygame.K_RETURN, pygame.K_TAB):
                 self.active = False
             elif len(self.text) < 30 and event.unicode.isprintable():
@@ -1192,7 +1203,7 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
         clock.tick(30)
 
 
-def client_lobby_screen(screen, clock, font, client, host_ip):
+def client_lobby_screen(screen, clock, font, client, host_ip, player_name="Player"):
     """
     Client lobby — waits for host to start.
     Returns "start" when game begins, "quit" to exit, "back" to cancel.
@@ -1207,8 +1218,11 @@ def client_lobby_screen(screen, clock, font, client, host_ip):
 
     back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
     panel_rect = pygame.Rect(cx - 230, 160, 460, 380)
+    retry_timer = 0.0
 
     while True:
+        dt = clock.tick(30) / 1000.0
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return "quit"
@@ -1219,6 +1233,13 @@ def client_lobby_screen(screen, clock, font, client, host_ip):
                     return "back"
 
         client.poll()
+
+        # Retry join if not connected yet
+        if not client.connected:
+            retry_timer += dt
+            if retry_timer >= 1.0:
+                retry_timer = 0.0
+                client.connect(host_ip, player_name)
 
         # Check if game started
         if client.connected and not client.in_lobby:
@@ -1731,6 +1752,7 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
 # ---------------------------------------------------------------------------
 def main():
     pygame.init()
+    pygame.scrap.init()
     screen = apply_display_mode()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 24, bold=True)
@@ -1802,7 +1824,7 @@ def main():
                 client = GameClient()
                 client.connect(mp_ip, player_name)
 
-                lobby_result = client_lobby_screen(screen, clock, font, client, mp_ip)
+                lobby_result = client_lobby_screen(screen, clock, font, client, mp_ip, player_name)
 
                 if lobby_result == "start":
                     result = join_loop(screen, clock, font, bg_surface, player_name,
