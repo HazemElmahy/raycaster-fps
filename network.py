@@ -16,8 +16,10 @@ import math
 from enemy_ai import ServerEnemyAI
 
 BROADCAST_PORT = 5555
+DISCOVERY_PORT = 5556  # separate port for LAN game discovery
 BUFFER_SIZE = 8192
 SERVER_TICK_RATE = 30  # broadcasts per second
+BEACON_INTERVAL = 1.0  # seconds between discovery beacons
 
 MAX_DEPTH = 50
 
@@ -394,3 +396,91 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# LAN Discovery — host broadcasts beacons, clients listen
+# ---------------------------------------------------------------------------
+class DiscoveryBeacon:
+    """Broadcasts a 'game available' beacon on the LAN periodically."""
+
+    def __init__(self, host_name, player_count_fn):
+        """
+        host_name: display name for this server
+        player_count_fn: callable that returns current player count
+        """
+        self.host_name = host_name
+        self.player_count_fn = player_count_fn
+        self.ip = get_local_ip()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+        self.sock.close()
+
+    def _loop(self):
+        while self.running:
+            beacon = json.dumps({
+                "t": "beacon",
+                "name": self.host_name,
+                "ip": self.ip,
+                "port": BROADCAST_PORT,
+                "players": self.player_count_fn(),
+            }, separators=(",", ":")).encode()
+            try:
+                self.sock.sendto(beacon, ("<broadcast>", DISCOVERY_PORT))
+            except OSError:
+                pass
+            time.sleep(BEACON_INTERVAL)
+
+
+class DiscoveryListener:
+    """Listens for game beacons on the LAN. Call poll() each frame."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.bind(("", DISCOVERY_PORT))
+        self.sock.setblocking(False)
+        self.games = {}  # ip -> {name, ip, port, players, last_seen}
+
+    def poll(self):
+        """Read incoming beacons. Call every frame."""
+        for _ in range(20):
+            data, addr = _recv(self.sock)
+            if data is None:
+                break
+            if data.get("t") == "beacon":
+                ip = data.get("ip", addr[0])
+                self.games[ip] = {
+                    "name": data.get("name", "Unknown"),
+                    "ip": ip,
+                    "port": data.get("port", BROADCAST_PORT),
+                    "players": data.get("players", 0),
+                    "last_seen": time.time(),
+                }
+
+        # Remove stale entries (not seen for 4 seconds)
+        now = time.time()
+        stale = [ip for ip, g in self.games.items() if now - g["last_seen"] > 4.0]
+        for ip in stale:
+            del self.games[ip]
+
+    def get_games(self):
+        """Return list of discovered games, sorted by most recent."""
+        return sorted(self.games.values(), key=lambda g: -g["last_seen"])
+
+    def stop(self):
+        self.sock.close()
