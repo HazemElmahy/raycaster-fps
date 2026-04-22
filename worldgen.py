@@ -182,9 +182,12 @@ def _assign_wall_types(grid, rooms):
                     grid[row][col] = wt
 
 
-def generate_dungeon(width=48, height=48, seed=None):
+def generate_dungeon(width=48, height=48, seed=None, enemy_count=None):
     """
     Generate a BSP dungeon.
+
+    Args:
+        enemy_count: total number of enemies to spawn (None = auto based on rooms)
 
     Returns:
         grid:          2D list (height x width), 0=floor, 1/2/3=wall
@@ -236,17 +239,33 @@ def generate_dungeon(width=48, height=48, seed=None):
 
     # Enemies spawn in ALL rooms including the first
     enemy_spawns = []
-    for i, room in enumerate(rooms):
-        count = random.randint(*ENEMIES_PER_ROOM)
-        for _ in range(count):
-            ex = random.uniform(room.x + 1, room.x + room.w - 1)
-            ey = random.uniform(room.y + 1, room.y + room.h - 1)
-            # Don't spawn right on top of the player in the first room
-            if i == 0 and abs(ex - player_spawn[0]) < 2 and abs(ey - player_spawn[1]) < 2:
-                # Push to room edge
-                ex = room.x + 1.5
-                ey = room.y + 1.5
-            enemy_spawns.append((ex, ey))
+    if enemy_count is not None and enemy_count > 0:
+        # Distribute requested count across rooms
+        per_room = max(1, enemy_count // len(rooms))
+        remainder = enemy_count - per_room * len(rooms)
+        for i, room in enumerate(rooms):
+            n = per_room + (1 if i < remainder else 0)
+            for _ in range(n):
+                ex = random.uniform(room.x + 1, room.x + room.w - 1)
+                ey = random.uniform(room.y + 1, room.y + room.h - 1)
+                if i == 0 and abs(ex - player_spawn[0]) < 2 and abs(ey - player_spawn[1]) < 2:
+                    ex = room.x + 1.5
+                    ey = room.y + 1.5
+                enemy_spawns.append((ex, ey))
+    else:
+        # Auto: 1-3 per room
+        for i, room in enumerate(rooms):
+            count = random.randint(*ENEMIES_PER_ROOM)
+            for _ in range(count):
+                ex = random.uniform(room.x + 1, room.x + room.w - 1)
+                ey = random.uniform(room.y + 1, room.y + room.h - 1)
+                if i == 0 and abs(ex - player_spawn[0]) < 2 and abs(ey - player_spawn[1]) < 2:
+                    ex = room.x + 1.5
+                    ey = room.y + 1.5
+                enemy_spawns.append((ex, ey))
+    # Clamp to requested count if specified
+    if enemy_count is not None:
+        enemy_spawns = enemy_spawns[:enemy_count]
 
     return grid, player_spawn, enemy_spawns, rooms
 

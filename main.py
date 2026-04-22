@@ -61,6 +61,7 @@ game_settings = {
     "fullscreen": False,
     "mouse_sensitivity": 0.003,
     "volume": 0.7,
+    "enemy_count": 20,
 }
 
 WHITE = (255, 255, 255)
@@ -128,12 +129,12 @@ CURRENT_ENEMY_SPAWNS = []   # set by new_dungeon()
 CURRENT_PLAYER_SPAWN = (2.0, 2.0)
 
 
-def new_dungeon(width=DUNGEON_WIDTH, height=DUNGEON_HEIGHT, seed=None):
+def new_dungeon(width=DUNGEON_WIDTH, height=DUNGEON_HEIGHT, seed=None, enemy_count=None):
     """Generate a fresh dungeon and update the global map state."""
     global WORLD_MAP, MAP_ROWS, MAP_COLS, CURRENT_ENEMY_SPAWNS, CURRENT_PLAYER_SPAWN
     from worldgen import generate_dungeon
 
-    grid, player_spawn, enemy_spawns, rooms = generate_dungeon(width, height, seed)
+    grid, player_spawn, enemy_spawns, rooms = generate_dungeon(width, height, seed, enemy_count)
     WORLD_MAP = grid
     MAP_ROWS = len(grid)
     MAP_COLS = len(grid[0])
@@ -930,7 +931,7 @@ def options_screen(screen, clock, font):
             if event.type == pygame.MOUSEBUTTONUP:
                 dragging_sens = False
 
-        # Update slider while dragging
+        # Update sliders while dragging
         if dragging_sens and mouse_pressed:
             frac = max(0.0, min(1.0, (mouse_pos[0] - sens_rect.x) / sens_rect.width))
             game_settings["mouse_sensitivity"] = 0.001 + frac * 0.009  # range 0.001 – 0.010
@@ -980,6 +981,60 @@ def options_screen(screen, clock, font):
 
         pygame.display.flip()
         clock.tick(30)
+
+
+def _draw_game_settings_sidebar(screen, rect, font, mouse_pos, mouse_pressed, dragging):
+    """
+    Draw a game settings sidebar panel. Returns updated dragging dict.
+    rect: the sidebar area Rect.
+    dragging: dict of slider states {"enemy_count": bool}
+    """
+    sub_font = _pixel_font(16)
+    row_font = _pixel_font(14)
+
+    # Panel background
+    if UI_SPRITES:
+        panel = pygame.transform.scale(UI_SPRITES["panel_small"],
+                                       (rect.width, rect.height))
+        screen.blit(panel, rect.topleft)
+    else:
+        pygame.draw.rect(screen, (22, 24, 35), rect)
+        pygame.draw.rect(screen, (60, 65, 85), rect, 1)
+
+    # Title
+    t = _pixel_text(sub_font, "GAME SETTINGS", (130, 135, 165))
+    screen.blit(t, (rect.x + 10, rect.y + 8))
+    pygame.draw.line(screen, (50, 55, 75),
+                     (rect.x + 8, rect.y + 28), (rect.right - 8, rect.y + 28), 1)
+
+    # Enemy Count slider
+    label = _pixel_text(row_font, "ENEMIES", (100, 105, 130))
+    screen.blit(label, (rect.x + 10, rect.y + 38))
+
+    slider_rect = pygame.Rect(rect.x + 10, rect.y + 58, rect.width - 20, 20)
+    val = game_settings["enemy_count"]
+    frac = val / 100.0  # 0-100 range
+
+    # Track
+    track_y = slider_rect.centery
+    pygame.draw.line(screen, LIGHT_GRAY, (slider_rect.x, track_y),
+                     (slider_rect.right, track_y), 2)
+    # Fill
+    fill_x = slider_rect.x + int(frac * slider_rect.width)
+    pygame.draw.line(screen, GREEN, (slider_rect.x, track_y), (fill_x, track_y), 3)
+    # Handle
+    pygame.draw.circle(screen, WHITE, (fill_x, track_y), 6)
+    pygame.draw.circle(screen, LIGHT_GRAY, (fill_x, track_y), 6, 1)
+    # Value
+    val_txt = _pixel_text(row_font, str(val), WHITE)
+    screen.blit(val_txt, (slider_rect.right - val_txt.get_width(), rect.y + 38))
+
+    # Handle dragging
+    if dragging.get("enemy_count") and mouse_pressed:
+        f = max(0.0, min(1.0, (mouse_pos[0] - slider_rect.x) / slider_rect.width))
+        game_settings["enemy_count"] = int(f * 100)
+
+    return dragging
 
 
 def _draw_menu_bg(screen):
@@ -1213,7 +1268,7 @@ def multiplayer_screen(screen, clock, font):
 
 def lobby_screen(screen, clock, font, server, beacon, player_name):
     """
-    Host lobby — waits for players, shows connected list.
+    Host lobby — player list on left, game settings sidebar on right.
     Returns "start" when host clicks Start, "quit" to exit, "back" to cancel.
     """
     pygame.mouse.set_visible(True)
@@ -1227,7 +1282,12 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
 
     start_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 130, 280, 48)
     back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
-    panel_rect = pygame.Rect(cx - 230, 160, 460, 380)
+
+    # Left: player list, Right: game settings
+    panel_rect = pygame.Rect(40, 160, 380, 380)
+    sidebar_rect = pygame.Rect(440, 160, 240, 380)
+
+    settings_drag = {"enemy_count": False}
 
     while True:
         for event in pygame.event.get():
@@ -1243,8 +1303,15 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
                     return "start"
                 if back_btn.collidepoint(event.pos):
                     return "back"
+                # Check sidebar slider
+                slider_area = pygame.Rect(sidebar_rect.x + 10, sidebar_rect.y + 48, sidebar_rect.width - 20, 30)
+                if slider_area.inflate(10, 20).collidepoint(event.pos):
+                    settings_drag["enemy_count"] = True
+            if event.type == pygame.MOUSEBUTTONUP:
+                settings_drag["enemy_count"] = False
 
         mouse_pos = pygame.mouse.get_pos()
+        mouse_pressed = pygame.mouse.get_pressed()[0]
         _draw_menu_bg(screen)
 
         # Title
@@ -1252,13 +1319,12 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
         screen.blit(t, t.get_rect(center=(cx, 50)))
         info = _pixel_text(sub_font, f"HOSTING ON {local_ip}", GREEN)
         screen.blit(info, info.get_rect(center=(cx, 85)))
-        pygame.draw.line(screen, (50, 55, 75), (cx - 160, 110), (cx + 160, 110), 2)
+        pygame.draw.line(screen, (50, 55, 75), (cx - 200, 110), (cx + 200, 110), 2)
 
-        # Waiting message
         msg = _pixel_text(sub_font, "Waiting for players to join...", (80, 85, 110))
         screen.blit(msg, msg.get_rect(center=(cx, 135)))
 
-        # Player list panel
+        # --- Left: Player list ---
         if UI_SPRITES:
             panel = pygame.transform.scale(UI_SPRITES["panel_large"],
                                            (panel_rect.width, panel_rect.height))
@@ -1267,7 +1333,7 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
             pygame.draw.rect(screen, (22, 24, 35), panel_rect)
             pygame.draw.rect(screen, (60, 65, 85), panel_rect, 1)
 
-        screen.blit(_pixel_text(sub_font, "CONNECTED PLAYERS", (100, 105, 130)),
+        screen.blit(_pixel_text(sub_font, "PLAYERS", (100, 105, 130)),
                     (panel_rect.x + 14, panel_rect.y + 10))
 
         players = server.get_lobby_players()
@@ -1283,23 +1349,22 @@ def lobby_screen(screen, clock, font, server, beacon, player_name):
                 pygame.draw.rect(screen, (30, 33, 48), row_rect)
                 pygame.draw.rect(screen, (50, 55, 72), row_rect, 1)
 
-            # Player color dot
             pc = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
             pygame.draw.circle(screen, pc, (row_rect.x + 16, py_pos + 15), 6)
             pygame.draw.circle(screen, BLACK, (row_rect.x + 16, py_pos + 15), 6, 1)
 
-            # Name
             screen.blit(_pixel_text(row_font, p["name"][:20], WHITE),
                         (row_rect.x + 30, py_pos + 5))
 
-            # Host badge
             if p["id"] == 0:
                 badge = _pixel_text(sub_font, "HOST", YELLOW)
                 screen.blit(badge, (row_rect.right - badge.get_width() - 10, py_pos + 7))
 
-        # Player count
         count_txt = _pixel_text(row_font, f"{len(players)} / 4", LIGHT_GRAY)
         screen.blit(count_txt, (panel_rect.right - count_txt.get_width() - 14, panel_rect.y + 10))
+
+        # --- Right: Game settings sidebar ---
+        _draw_game_settings_sidebar(screen, sidebar_rect, font, mouse_pos, mouse_pressed, settings_drag)
 
         # Buttons
         can_start = len(players) >= 1
@@ -1357,7 +1422,7 @@ def client_lobby_screen(screen, clock, font, client, host_ip, player_name="Playe
         # Generate dungeon from seed once we get it
         if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
             if MAP_COLS == 16:  # still on placeholder
-                new_dungeon(seed=client.dungeon_seed)
+                new_dungeon(seed=client.dungeon_seed, enemy_count=getattr(client, 'enemy_count', None))
 
         # Check if game started
         if client.connected and not client.in_lobby:
@@ -1425,12 +1490,76 @@ def client_lobby_screen(screen, clock, font, client, host_ip, player_name="Playe
 # ---------------------------------------------------------------------------
 # Game loops
 # ---------------------------------------------------------------------------
+def singleplayer_pregame(screen, clock, font):
+    """
+    Pre-game screen for singleplayer — pick game settings, then start.
+    Returns "start", "back", or "quit".
+    """
+    pygame.mouse.set_visible(True)
+    pygame.event.set_grab(False)
+
+    title_font = _pixel_font(32)
+    sub_font = _pixel_font(16)
+    cx = SCREEN_WIDTH // 2
+
+    start_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 130, 280, 48)
+    back_btn = pygame.Rect(cx - 140, SCREEN_HEIGHT - 70, 280, 44)
+    sidebar_rect = pygame.Rect(cx - 120, 180, 240, 380)
+
+    settings_drag = {"enemy_count": False}
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return "quit"
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    return "back"
+                if event.key == pygame.K_RETURN:
+                    return "start"
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if start_btn.collidepoint(event.pos):
+                    return "start"
+                if back_btn.collidepoint(event.pos):
+                    return "back"
+                slider_area = pygame.Rect(sidebar_rect.x + 10, sidebar_rect.y + 48,
+                                          sidebar_rect.width - 20, 30)
+                if slider_area.inflate(10, 20).collidepoint(event.pos):
+                    settings_drag["enemy_count"] = True
+            if event.type == pygame.MOUSEBUTTONUP:
+                settings_drag["enemy_count"] = False
+
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_pressed = pygame.mouse.get_pressed()[0]
+        _draw_menu_bg(screen)
+
+        # Title
+        t = _pixel_text(title_font, "NEW GAME", (180, 185, 210))
+        screen.blit(t, t.get_rect(center=(cx, 60)))
+        pygame.draw.line(screen, (50, 55, 75), (cx - 140, 90), (cx + 140, 90), 2)
+
+        sub = _pixel_text(sub_font, "Configure your dungeon run", (80, 85, 110))
+        screen.blit(sub, sub.get_rect(center=(cx, 120)))
+
+        # Settings panel (centered)
+        _draw_game_settings_sidebar(screen, sidebar_rect, font, mouse_pos, mouse_pressed, settings_drag)
+
+        # Buttons
+        _draw_button(screen, start_btn, "START GAME", _pixel_font(22),
+                     start_btn.collidepoint(mouse_pos), active=True)
+        _draw_button(screen, back_btn, "BACK", _pixel_font(20),
+                     back_btn.collidepoint(mouse_pos))
+
+        pygame.display.flip()
+        clock.tick(30)
+
+
 def singleplayer_loop(screen, clock, font, bg_surface):
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
 
     def reset():
-        player_spawn, _ = new_dungeon()
+        player_spawn, _ = new_dungeon(enemy_count=game_settings["enemy_count"])
         return {
             "px": player_spawn[0], "py": player_spawn[1], "pangle": 0.0,
             "pitch": 0.0, "ads": 0.0,
@@ -1565,7 +1694,7 @@ def singleplayer_loop(screen, clock, font, bg_surface):
                     st["dead"] = True
 
         # Win condition: all enemies dead
-        if enemies_left == 0 and not st["won"]:
+        if enemies_left == 0 and not st["won"] and st["total_enemies"] > 0:
             st["won"] = True
 
         # Render
@@ -1590,10 +1719,11 @@ def host_loop(screen, clock, font, bg_surface, player_name, server=None, beacon=
         # Legacy path: create server inline (no lobby)
         import random as _rng
         seed = _rng.randint(0, 999999)
-        new_dungeon(seed=seed)
+        ec = game_settings["enemy_count"]
+        new_dungeon(seed=seed, enemy_count=ec)
         game_name = f"{player_name}'s Game"
         server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN,
-                            host_name=game_name, dungeon_seed=seed)
+                            host_name=game_name, dungeon_seed=seed, enemy_count=ec)
         server.start()
         server.register_host(player_name)
         server.start_game()
@@ -1730,7 +1860,7 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
 
     # Generate the same dungeon as the host using the seed from the welcome packet
     if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
-        new_dungeon(seed=client.dungeon_seed)
+        new_dungeon(seed=client.dungeon_seed, enemy_count=getattr(client, 'enemy_count', None))
 
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
@@ -1778,7 +1908,7 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
             # Generate dungeon from seed once connected (first time only)
             if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
                 if MAP_COLS == 16:  # still on placeholder map
-                    new_dungeon(seed=client.dungeon_seed)
+                    new_dungeon(seed=client.dungeon_seed, enemy_count=getattr(client, 'enemy_count', None))
                     px = client.spawn_x
                     py = client.spawn_y
 
@@ -1908,9 +2038,13 @@ def main():
                 break
 
         elif choice == "singleplayer":
-            result = singleplayer_loop(screen, clock, font, bg_surface)
-            if result == "quit":
+            pregame = singleplayer_pregame(screen, clock, font)
+            if pregame == "quit":
                 break
+            elif pregame == "start":
+                result = singleplayer_loop(screen, clock, font, bg_surface)
+                if result == "quit":
+                    break
 
         elif choice == "multiplayer":
             # Multiplayer submenu
@@ -1924,10 +2058,11 @@ def main():
                 # Create server + beacon, show lobby
                 import random as _rng
                 dungeon_seed = _rng.randint(0, 999999)
-                new_dungeon(seed=dungeon_seed)
+                new_dungeon(seed=dungeon_seed, enemy_count=game_settings["enemy_count"])
                 game_name = f"{player_name}'s Game"
                 server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN,
-                                    host_name=game_name, dungeon_seed=dungeon_seed)
+                                    host_name=game_name, dungeon_seed=dungeon_seed,
+                                    enemy_count=game_settings["enemy_count"])
                 server.start()
                 server.register_host(player_name)
                 beacon = DiscoveryBeacon(game_name, lambda: len(server.players))
