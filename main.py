@@ -322,8 +322,13 @@ def draw_enemies_from_list(surface, enemy_list, px, py, pangle, wall_depths, gam
         _draw_enemy_sprite(surface, sx, dist, wall_depths, ai_state, dmg, game_time, pitch_offset)
 
 
-def _draw_player_sprite(surface, screen_x, dist, body_color, wall_depths, pitch_offset=0):
-    """Draw a player as a simple colored humanoid."""
+def _draw_player_sprite(surface, screen_x, dist, body_color, wall_depths,
+                        pitch_offset=0, facing_angle=0.0, view_angle=0.0, weapon_id=1):
+    """
+    Draw a player with directional facing and visible weapon.
+    facing_angle: the direction the other player is looking (radians)
+    view_angle: the angle from the viewer to the other player (radians)
+    """
     sprite_height = min(SCREEN_HEIGHT, int(SCREEN_HEIGHT * 0.6 / max(dist, 0.1)))
     sprite_width = sprite_height // 2
     ray_idx = int(screen_x / SCREEN_WIDTH * NUM_RAYS)
@@ -331,23 +336,124 @@ def _draw_player_sprite(surface, screen_x, dist, body_color, wall_depths, pitch_
         return
     shade = max(0.2, 1.0 - dist / MAX_DEPTH)
     bc = tuple(max(0, min(255, int(c * shade))) for c in body_color)
-    hc = tuple(max(0, min(255, int(c * shade))) for c in (220, 180, 150))
+    skin = tuple(max(0, min(255, int(c * shade))) for c in (220, 180, 150))
+    dark_bc = tuple(max(0, min(255, int(c * shade * 0.6))) for c in body_color)
+
     top = SCREEN_HEIGHT // 2 - sprite_height // 2 + pitch_offset
-    pygame.draw.rect(surface, bc, (
-        screen_x - sprite_width // 2, top + sprite_height // 4,
-        sprite_width, sprite_height * 3 // 4))
-    hr = max(2, sprite_width // 3)
+    hw = sprite_width // 2
+    hr = max(2, sprite_width // 3)  # head radius
+
+    # Relative angle: how much they're turned away from facing us
+    # 0 = facing us, pi = facing away, pi/2 = side view
+    rel = facing_angle - view_angle
+    while rel > math.pi: rel -= 2 * math.pi
+    while rel < -math.pi: rel += 2 * math.pi
+    # rel ~ 0 means they face toward us, rel ~ pi means away
+    # face_dot: 1 = facing us, -1 = facing away
+    face_dot = math.cos(rel)
+    # side: positive = their right side visible, negative = left side
+    side = math.sin(rel)
+
+    # --- Body ---
+    body_top = top + sprite_height // 4
+    body_h = sprite_height * 3 // 4
+
+    # Facing-away darkening
+    if face_dot < -0.2:
+        # Mostly facing away — darker body
+        pygame.draw.rect(surface, dark_bc, (screen_x - hw, body_top, sprite_width, body_h))
+    else:
+        pygame.draw.rect(surface, bc, (screen_x - hw, body_top, sprite_width, body_h))
+        # Chest highlight when facing toward us
+        if sprite_width > 8:
+            chest_w = max(2, sprite_width // 3)
+            chest_h = max(2, body_h // 4)
+            pygame.draw.rect(surface, tuple(min(255, c + 20) for c in bc),
+                             (screen_x - chest_w // 2, body_top + 4, chest_w, chest_h))
+
+    # --- Head ---
     hy = top + sprite_height // 6
-    pygame.draw.circle(surface, hc, (screen_x, hy), hr)
-    if hr > 4:
-        eo = hr // 3
-        er = max(1, hr // 5)
-        pygame.draw.circle(surface, BLACK, (screen_x - eo, hy - er), er)
-        pygame.draw.circle(surface, BLACK, (screen_x + eo, hy - er), er)
+    pygame.draw.circle(surface, skin, (screen_x, hy), hr)
+
+    if hr > 3:
+        if face_dot > 0.0:
+            # Facing us: draw eyes, offset by side angle
+            eye_offset = int(side * hr * 0.4)
+            eo = max(1, hr // 3)
+            er = max(1, hr // 5)
+            pygame.draw.circle(surface, BLACK,
+                               (screen_x - eo + eye_offset, hy - er), er)
+            pygame.draw.circle(surface, BLACK,
+                               (screen_x + eo + eye_offset, hy - er), er)
+        elif face_dot < -0.3:
+            # Facing away: draw back of head (darker circle, no eyes)
+            dark_skin = tuple(max(0, int(c * 0.7)) for c in skin)
+            pygame.draw.circle(surface, dark_skin, (screen_x, hy), max(1, hr - 1))
+        else:
+            # Side view: one eye visible
+            eye_x = screen_x + int(side * hr * 0.3)
+            er = max(1, hr // 5)
+            pygame.draw.circle(surface, BLACK, (eye_x, hy - er), er)
+
+    # --- Weapon ---
+    if sprite_height > 16:
+        # Weapon position: offset to the side they're facing
+        wpn_side = 1 if side >= 0 else -1
+        wpn_x = screen_x + int(wpn_side * hw * 0.8)
+        wpn_y = body_top + body_h // 3
+
+        # Weapon direction line (points where they're looking)
+        wpn_len = max(4, sprite_height // 4)
+        wpn_end_x = wpn_x + int(math.cos(rel) * wpn_len * 0.5)
+        wpn_end_y = wpn_y - int(abs(math.sin(rel)) * wpn_len * 0.2)
+
+        gun_color = tuple(max(0, min(255, int(c * shade))) for c in (70, 70, 75))
+        gun_light = tuple(max(0, min(255, int(c * shade))) for c in (90, 90, 95))
+        wood_color = tuple(max(0, min(255, int(c * shade))) for c in (80, 55, 35))
+        blade_color = tuple(max(0, min(255, int(c * shade))) for c in (180, 185, 195))
+
+        if weapon_id == WPN_RIFLE:
+            # Long rifle
+            barrel_w = max(2, sprite_width // 8)
+            pygame.draw.line(surface, gun_color, (wpn_x, wpn_y),
+                             (wpn_end_x, wpn_end_y), max(2, barrel_w))
+            # Stock
+            stock_x = wpn_x - int(math.cos(rel) * wpn_len * 0.3)
+            pygame.draw.line(surface, wood_color, (wpn_x, wpn_y),
+                             (stock_x, wpn_y + max(2, sprite_height // 10)),
+                             max(2, barrel_w + 1))
+            # Scope dot
+            scope_x = wpn_x + int(math.cos(rel) * wpn_len * 0.2)
+            scope_y = wpn_y - max(1, barrel_w)
+            pygame.draw.circle(surface, gun_light, (scope_x, scope_y),
+                               max(1, barrel_w // 2 + 1))
+
+        elif weapon_id == WPN_PISTOL:
+            # Short pistol
+            barrel_w = max(2, sprite_width // 10)
+            short_end_x = wpn_x + int(math.cos(rel) * wpn_len * 0.3)
+            short_end_y = wpn_y - int(abs(math.sin(rel)) * wpn_len * 0.1)
+            pygame.draw.line(surface, gun_color, (wpn_x, wpn_y),
+                             (short_end_x, short_end_y), max(2, barrel_w))
+            # Grip
+            pygame.draw.line(surface, gun_light, (wpn_x, wpn_y),
+                             (wpn_x, wpn_y + max(2, sprite_height // 12)),
+                             max(1, barrel_w))
+
+        elif weapon_id == WPN_KNIFE:
+            # Knife blade
+            blade_end_x = wpn_x + int(math.cos(rel) * wpn_len * 0.35)
+            blade_end_y = wpn_y - int(abs(math.sin(rel)) * wpn_len * 0.15)
+            pygame.draw.line(surface, blade_color, (wpn_x, wpn_y),
+                             (blade_end_x, blade_end_y), max(1, sprite_width // 12))
+            # Handle
+            pygame.draw.line(surface, wood_color, (wpn_x, wpn_y),
+                             (wpn_x, wpn_y + max(2, sprite_height // 14)),
+                             max(1, sprite_width // 12))
 
 
 def draw_other_players(surface, players, my_id, px, py, pangle, wall_depths, pitch_offset=0):
-    """Draw other players as colored humanoid sprites."""
+    """Draw other players with directional facing and equipped weapons."""
     render = []
     for pid_str, p in players.items():
         pid = int(pid_str)
@@ -362,13 +468,16 @@ def draw_other_players(surface, players, my_id, px, py, pangle, wall_depths, pit
         while ad < -math.pi: ad += 2 * math.pi
         if abs(ad) > HALF_FOV + 0.1:
             continue
-        render.append((dist, pid, ad))
+        # angle from us to them (world space)
+        angle_to_them = math.atan2(dy, dx)
+        render.append((dist, pid, ad, p.get("a", 0.0), angle_to_them, p.get("w", 1)))
 
     render.sort(key=lambda r: -r[0])
-    for dist, pid, ad in render:
+    for dist, pid, ad, facing, angle_to, wpn_id in render:
         sx = int((ad / FOV + 0.5) * SCREEN_WIDTH)
         pc = PLAYER_COLORS[pid % len(PLAYER_COLORS)]
-        _draw_player_sprite(surface, sx, dist, pc, wall_depths, pitch_offset)
+        _draw_player_sprite(surface, sx, dist, pc, wall_depths, pitch_offset,
+                            facing_angle=facing, view_angle=angle_to, weapon_id=wpn_id)
 
 
 # ---------------------------------------------------------------------------

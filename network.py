@@ -182,7 +182,7 @@ class GameServer:
                 "a": round(p["angle"], 3),
                 "hp": p["health"], "ammo": p["ammo"],
                 "score": p["score"], "alive": p["alive"],
-                "name": p["name"],
+                "name": p["name"], "w": p.get("weapon", 1),
             }
         enemies = [
             {"x": round(e["x"], 3), "y": round(e["y"], 3),
