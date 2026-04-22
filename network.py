@@ -72,13 +72,14 @@ def _recv(sock):
 # Server (runs on the host's machine alongside their game client)
 # ---------------------------------------------------------------------------
 class GameServer:
-    def __init__(self, world_map, spawn_enemies_fn, player_spawn=None, host_name="Game"):
+    def __init__(self, world_map, spawn_enemies_fn, player_spawn=None, host_name="Game", dungeon_seed=None):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", BROADCAST_PORT))
         self.sock.setblocking(False)
 
         self.host_name = host_name
+        self.dungeon_seed = dungeon_seed
         self.world_map = world_map
         self.map_rows = len(world_map)
         self.map_cols = len(world_map[0])
@@ -205,7 +206,7 @@ class GameServer:
                 else:
                     pid = self.addr_to_id[addr]
                 sx, sy = self.player_spawn
-                _send(self.sock, {"t": "welcome", "id": pid, "x": sx, "y": sy}, addr)
+                _send(self.sock, {"t": "welcome", "id": pid, "x": sx, "y": sy, "seed": self.dungeon_seed}, addr)
 
             elif msg_type == "state":
                 pid = self.addr_to_id.get(addr)
@@ -404,6 +405,7 @@ class GameClient:
                 self.my_id = data["id"]
                 self.spawn_x = data.get("x", 2.0)
                 self.spawn_y = data.get("y", 2.0)
+                self.dungeon_seed = data.get("seed")
                 self.connected = True
             elif msg_type == "world":
                 self.world = data

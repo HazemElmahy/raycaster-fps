@@ -1245,6 +1245,11 @@ def client_lobby_screen(screen, clock, font, client, host_ip, player_name="Playe
                 retry_timer = 0.0
                 client.connect(host_ip, player_name)
 
+        # Generate dungeon from seed once we get it
+        if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
+            if MAP_COLS == 16:  # still on placeholder
+                new_dungeon(seed=client.dungeon_seed)
+
         # Check if game started
         if client.connected and not client.in_lobby:
             return "start"
@@ -1474,9 +1479,12 @@ def host_loop(screen, clock, font, bg_surface, player_name, server=None, beacon=
     """Host a multiplayer game. Runs a server + plays as player 0."""
     if server is None:
         # Legacy path: create server inline (no lobby)
-        new_dungeon()
+        import random as _rng
+        seed = _rng.randint(0, 999999)
+        new_dungeon(seed=seed)
         game_name = f"{player_name}'s Game"
-        server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN, host_name=game_name)
+        server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN,
+                            host_name=game_name, dungeon_seed=seed)
         server.start()
         server.register_host(player_name)
         server.start_game()
@@ -1611,11 +1619,17 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
         client = GameClient()
         client.connect(host_ip, player_name)
 
+    # Generate the same dungeon as the host using the seed from the welcome packet
+    if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
+        new_dungeon(seed=client.dungeon_seed)
+
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
 
-    # We'll start at a default pos and update once we get the welcome
-    px, py, pangle_val = 2.0, 2.0, 0.0
+    # Start at spawn position from server
+    spawn_x = getattr(client, 'spawn_x', 2.0)
+    spawn_y = getattr(client, 'spawn_y', 2.0)
+    px, py, pangle_val = spawn_x, spawn_y, 0.0
     pitch_val = 0.0
     shooting_timer = 0.0
     damage_timer = 0.0
@@ -1652,10 +1666,12 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
 
             client.poll()
 
-            # Use spawn position from server once connected
-            if client.connected and hasattr(client, 'spawn_x') and px == 2.0 and py == 2.0:
-                px = client.spawn_x
-                py = client.spawn_y
+            # Generate dungeon from seed once connected (first time only)
+            if client.connected and hasattr(client, 'dungeon_seed') and client.dungeon_seed is not None:
+                if MAP_COLS == 16:  # still on placeholder map
+                    new_dungeon(seed=client.dungeon_seed)
+                    px = client.spawn_x
+                    py = client.spawn_y
 
             # Retry connection
             if not client.connected:
@@ -1797,10 +1813,12 @@ def main():
                 continue
             elif mp_result == "host":
                 # Create server + beacon, show lobby
-                new_dungeon()
+                import random as _rng
+                dungeon_seed = _rng.randint(0, 999999)
+                new_dungeon(seed=dungeon_seed)
                 game_name = f"{player_name}'s Game"
                 server = GameServer(WORLD_MAP, spawn_enemies, CURRENT_PLAYER_SPAWN,
-                                    host_name=game_name)
+                                    host_name=game_name, dungeon_seed=dungeon_seed)
                 server.start()
                 server.register_host(player_name)
                 beacon = DiscoveryBeacon(game_name, lambda: len(server.players))
