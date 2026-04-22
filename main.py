@@ -692,12 +692,16 @@ class TextInput:
             elif event.key == pygame.K_v and (event.mod & pygame.KMOD_CTRL):
                 # Ctrl+V paste from clipboard
                 try:
-                    clip = pygame.scrap.get(pygame.SCRAP_TEXT)
-                    if clip:
-                        pasted = clip.decode("utf-8").rstrip("\x00").strip()
-                        self.text = (self.text + pasted)[:30]
+                    pasted = pygame.scrap.get_text()
+                    if pasted:
+                        self.text = (self.text + pasted.strip())[:30]
                 except Exception:
-                    pass
+                    try:
+                        clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+                        if clip:
+                            self.text = (self.text + clip.decode("utf-8").rstrip("\x00").strip())[:30]
+                    except Exception:
+                        pass
             elif event.key == pygame.K_a and (event.mod & pygame.KMOD_CTRL):
                 pass  # Ctrl+A select all (no-op, prevent typing 'a')
             elif event.key in (pygame.K_RETURN, pygame.K_TAB):
@@ -1752,7 +1756,6 @@ def join_loop(screen, clock, font, bg_surface, player_name, host_ip, client=None
 # ---------------------------------------------------------------------------
 def main():
     pygame.init()
-    pygame.scrap.init()
     screen = apply_display_mode()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 24, bold=True)
