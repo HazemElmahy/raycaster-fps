@@ -17,6 +17,7 @@ from enemy_ai import ServerEnemyAI
 
 BROADCAST_PORT = 5555
 DISCOVERY_PORT = 5556  # separate port for LAN game discovery
+MULTICAST_GROUP = "239.255.77.77"  # multicast address for discovery (works across ZeroTier/VPN)
 BUFFER_SIZE = 8192
 SERVER_TICK_RATE = 30  # broadcasts per second
 BEACON_INTERVAL = 1.0  # seconds between discovery beacons
@@ -402,19 +403,23 @@ def get_local_ip():
 # LAN Discovery — host broadcasts beacons, clients listen
 # ---------------------------------------------------------------------------
 class DiscoveryBeacon:
-    """Broadcasts a 'game available' beacon on the LAN periodically."""
+    """Sends game discovery beacons via multicast + broadcast."""
 
     def __init__(self, host_name, player_count_fn):
-        """
-        host_name: display name for this server
-        player_count_fn: callable that returns current player count
-        """
         self.host_name = host_name
         self.player_count_fn = player_count_fn
         self.ip = get_local_ip()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Multicast socket (works across ZeroTier / VPN / virtual LANs)
+        self.msock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.msock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+        self.msock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Broadcast socket (works on physical LAN)
+        self.bsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.bsock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.bsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         self.running = False
         self.thread = None
 
@@ -427,7 +432,14 @@ class DiscoveryBeacon:
         self.running = False
         if self.thread:
             self.thread.join(timeout=2)
-        self.sock.close()
+        try:
+            self.msock.close()
+        except OSError:
+            pass
+        try:
+            self.bsock.close()
+        except OSError:
+            pass
 
     def _loop(self):
         while self.running:
@@ -438,22 +450,32 @@ class DiscoveryBeacon:
                 "port": BROADCAST_PORT,
                 "players": self.player_count_fn(),
             }, separators=(",", ":")).encode()
+            # Send on both multicast and broadcast for maximum compatibility
             try:
-                self.sock.sendto(beacon, ("<broadcast>", DISCOVERY_PORT))
+                self.msock.sendto(beacon, (MULTICAST_GROUP, DISCOVERY_PORT))
+            except OSError:
+                pass
+            try:
+                self.bsock.sendto(beacon, ("<broadcast>", DISCOVERY_PORT))
             except OSError:
                 pass
             time.sleep(BEACON_INTERVAL)
 
 
 class DiscoveryListener:
-    """Listens for game beacons on the LAN. Call poll() each frame."""
+    """Listens for game beacons via multicast + broadcast."""
 
     def __init__(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(("", DISCOVERY_PORT))
         self.sock.setblocking(False)
+
+        # Join multicast group to receive beacons across ZeroTier/VPN
+        import struct
+        mreq = struct.pack("4sL", socket.inet_aton(MULTICAST_GROUP), socket.INADDR_ANY)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
         self.games = {}  # ip -> {name, ip, port, players, last_seen}
 
     def poll(self):
